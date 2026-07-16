@@ -27,11 +27,14 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 #include <rfb/keysym.h>
 #include <rfb/rfb.h>
 
+#define SCRCPY_DEFAULT_HOST "127.0.0.1"
+#define SCRCPY_DEFAULT_PORT 27183
 #define SCRCPY_CODEC_H264 UINT32_C(0x68323634)
 #define SCRCPY_PACKET_FLAG_SESSION (UINT64_C(1) << 63)
 #define SCRCPY_PACKET_FLAG_CONFIG (UINT64_C(1) << 62)
@@ -73,7 +76,6 @@ struct client_state {
     int ordinary_applied_jpeg_quality;
     int waiting_for_key_frame;
     int framebuffer_lock_held;
-    int ordinary_update_timer_active;
     int previous_left_button;
     int previous_wheel_buttons;
     int last_pointer_x;
@@ -98,9 +100,8 @@ static size_t frame_queue_count;
 static uint64_t frame_next_sequence = 1;
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Compressed packets waiting for the fallback decoder thread. Decoding runs
- * off the video reader thread so a slow decode can never stall the H.264
- * passthrough path's socket reads. */
+/* Packets for the fallback decoder thread: decoding off the video reader
+ * thread means a slow decode never stalls the passthrough socket reads. */
 static struct frame decode_queue[DECODE_QUEUE_CAPACITY];
 static size_t decode_queue_head;
 static size_t decode_queue_count;
@@ -156,32 +157,6 @@ static uint64_t elapsed_us(const struct timespec *start,
     int64_t nanoseconds = end->tv_nsec - start->tv_nsec;
     int64_t total = seconds * INT64_C(1000000000) + nanoseconds;
     return total > 0 ? (uint64_t) total / 1000 : 0;
-}
-
-static uint32_t read_u32be(const uint8_t *p) {
-    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16)
-         | ((uint32_t) p[2] << 8) | p[3];
-}
-
-static uint64_t read_u64be(const uint8_t *p) {
-    return ((uint64_t) read_u32be(p) << 32) | read_u32be(p + 4);
-}
-
-static void write_u16be(uint8_t *p, uint16_t value) {
-    p[0] = value >> 8;
-    p[1] = value;
-}
-
-static void write_u32be(uint8_t *p, uint32_t value) {
-    p[0] = value >> 24;
-    p[1] = value >> 16;
-    p[2] = value >> 8;
-    p[3] = value;
-}
-
-static void write_u64be(uint8_t *p, uint64_t value) {
-    write_u32be(p, value >> 32);
-    write_u32be(p + 4, value);
 }
 
 static int recv_all(int fd, void *buffer, size_t size) {
@@ -268,10 +243,9 @@ static uint64_t latest_key_sequence_locked(void) {
     return sequence;
 }
 
-static int reset_scrcpy_video(void) {
-    const uint8_t message = SCRCPY_MSG_RESET_VIDEO;
+static int send_control(const void *message, size_t size) {
     pthread_mutex_lock(&control_mutex);
-    int result = send_all(control_fd, &message, sizeof(message));
+    int result = send_all(control_fd, message, size);
     pthread_mutex_unlock(&control_mutex);
     return result;
 }
@@ -279,6 +253,7 @@ static int reset_scrcpy_video(void) {
 /* Ask scrcpy for a fresh config packet and keyframe. Unless forced, at most
  * one request per second goes out no matter how many clients are waiting. */
 static void request_video_reset(int force) {
+    const uint8_t message = SCRCPY_MSG_RESET_VIDEO;
     uint64_t now = monotonic_ns();
     int send_reset = 0;
 
@@ -290,7 +265,7 @@ static void request_video_reset(int force) {
     }
     pthread_mutex_unlock(&reset_mutex);
 
-    if (send_reset && reset_scrcpy_video() < 0) {
+    if (send_reset && send_control(&message, sizeof(message)) < 0) {
         fprintf(stderr, "failed to request a video reset\n");
     }
 }
@@ -318,10 +293,10 @@ static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
 }
 
 /* Non-blocking: copy the next access unit this client should send, skipping
- * to the newest keyframe when the client has fallen behind. Returns 0 when
- * the client has to wait for a later enqueue; *needs_keyframe is set when
- * the stream cannot resume without a fresh keyframe, *more_pending when
- * another eligible frame is already queued behind the returned one. */
+ * to the newest keyframe when it has fallen behind. Returns 0 when it must
+ * wait for a later enqueue; *needs_keyframe means the stream cannot resume
+ * without a fresh keyframe, *more_pending that another eligible frame is
+ * already queued behind the returned one. */
 static int copy_next_frame(struct client_state *state, struct frame *frame,
                            int *needs_keyframe, int *more_pending) {
     struct frame *source = NULL;
@@ -337,11 +312,12 @@ static int copy_next_frame(struct client_state *state, struct frame *frame,
             state->waiting_for_key_frame = 1;
         }
 
-        uint64_t latest_key = latest_key_sequence_locked();
-        if (latest_key > state->next_sequence &&
-            frame_next_sequence - state->next_sequence > 6) {
-            state->next_sequence = latest_key;
-            state->waiting_for_key_frame = 0;
+        if (frame_next_sequence - state->next_sequence > 6) {
+            uint64_t latest_key = latest_key_sequence_locked();
+            if (latest_key > state->next_sequence) {
+                state->next_sequence = latest_key;
+                state->waiting_for_key_frame = 0;
+            }
         }
 
         for (size_t i = 0; i < frame_queue_count; ++i) {
@@ -504,8 +480,6 @@ static void decode_submit(const uint8_t *data, size_t size, int key_frame) {
         clear_decode_queue_locked();
         fallback_decoder_reset = 1;
         if (!key_frame) {
-            /* Cannot resume from a delta frame: drop until the reset-
-             * triggered keyframe arrives. */
             decode_skip_until_key = 1;
             pthread_mutex_unlock(&decode_mutex);
             request_video_reset(0);
@@ -566,17 +540,17 @@ static void *video_reader_main(void *unused) {
             break;
         }
 
-        uint64_t pts_flags = read_u64be(header);
+        uint64_t pts_flags = AV_RB64(header);
         if (pts_flags & SCRCPY_PACKET_FLAG_SESSION) {
-            int width = (int) read_u32be(header + 4);
-            int height = (int) read_u32be(header + 8);
+            int width = (int) AV_RB32(header + 4);
+            int height = (int) AV_RB32(header + 8);
             fprintf(stderr, "scrcpy session: %dx%d%s\n", width, height,
                     (width == video_width && height == video_height)
                         ? "" : " (resize requires restart)");
             continue;
         }
 
-        uint32_t packet_size = read_u32be(header + 8);
+        uint32_t packet_size = AV_RB32(header + 8);
         if (!packet_size || packet_size > MAX_PACKET_SIZE) {
             fprintf(stderr, "invalid scrcpy packet size: %u\n", packet_size);
             break;
@@ -631,9 +605,8 @@ static void *control_drain_main(void *unused) {
 }
 
 /* Non-blocking Open H.264 frame hook. A client stuck waiting for a keyframe
- * (e.g. one that connected while the screen was static and the queue held
- * only delta frames) triggers a rate-limited encoder reset so its stream can
- * start without waiting for on-screen motion. */
+ * (connected while the screen was static) triggers a rate-limited encoder
+ * reset so its stream starts without waiting for on-screen motion. */
 static rfbBool h264_frame_hook(rfbClientPtr client, char **buffer,
                                size_t *size) {
     struct frame frame = {0};
@@ -714,18 +687,15 @@ static int send_touch(uint8_t action, int x, int y, int pressed) {
     uint8_t message[32] = {0};
     message[0] = SCRCPY_MSG_INJECT_TOUCH;
     message[1] = action;
-    write_u64be(message + 2, SCRCPY_POINTER_ID_MOUSE);
-    write_u32be(message + 10, (uint32_t) x);
-    write_u32be(message + 14, (uint32_t) y);
-    write_u16be(message + 18, (uint16_t) video_width);
-    write_u16be(message + 20, (uint16_t) video_height);
-    write_u16be(message + 22, pressed ? UINT16_MAX : 0);
-    write_u32be(message + 24, pressed ? 1U : 0U);
-    write_u32be(message + 28, pressed ? 1U : 0U);
-    pthread_mutex_lock(&control_mutex);
-    int result = send_all(control_fd, message, sizeof(message));
-    pthread_mutex_unlock(&control_mutex);
-    return result;
+    AV_WB64(message + 2, SCRCPY_POINTER_ID_MOUSE);
+    AV_WB32(message + 10, (uint32_t) x);
+    AV_WB32(message + 14, (uint32_t) y);
+    AV_WB16(message + 18, (uint16_t) video_width);
+    AV_WB16(message + 20, (uint16_t) video_height);
+    AV_WB16(message + 22, pressed ? UINT16_MAX : 0);
+    AV_WB32(message + 24, pressed ? 1U : 0U);
+    AV_WB32(message + 28, pressed ? 1U : 0U);
+    return send_control(message, sizeof(message));
 }
 
 /* hscroll/vscroll are one wheel click each, encoded as scrcpy i16
@@ -733,17 +703,14 @@ static int send_touch(uint8_t action, int x, int y, int pressed) {
 static int send_scroll(int x, int y, int hscroll, int vscroll) {
     uint8_t message[21] = {0};
     message[0] = SCRCPY_MSG_INJECT_SCROLL;
-    write_u32be(message + 1, (uint32_t) x);
-    write_u32be(message + 5, (uint32_t) y);
-    write_u16be(message + 9, (uint16_t) video_width);
-    write_u16be(message + 11, (uint16_t) video_height);
-    write_u16be(message + 13, (uint16_t) (int16_t) (hscroll * 32767));
-    write_u16be(message + 15, (uint16_t) (int16_t) (vscroll * 32767));
-    write_u32be(message + 17, 0);
-    pthread_mutex_lock(&control_mutex);
-    int result = send_all(control_fd, message, sizeof(message));
-    pthread_mutex_unlock(&control_mutex);
-    return result;
+    AV_WB32(message + 1, (uint32_t) x);
+    AV_WB32(message + 5, (uint32_t) y);
+    AV_WB16(message + 9, (uint16_t) video_width);
+    AV_WB16(message + 11, (uint16_t) video_height);
+    AV_WB16(message + 13, (uint16_t) (int16_t) (hscroll * 32767));
+    AV_WB16(message + 15, (uint16_t) (int16_t) (vscroll * 32767));
+    AV_WB32(message + 17, 0);
+    return send_control(message, sizeof(message));
 }
 
 static void pointer_event(int button_mask, int x, int y, rfbClientPtr client) {
@@ -752,9 +719,8 @@ static void pointer_event(int button_mask, int x, int y, rfbClientPtr client) {
         return;
     }
 
-    /* RFB buttons 4-7 (mask bits 3-6) are wheel up/down/left/right. Each
-     * click arrives as a press/release pair; inject on the press edge. Wheel
-     * events do not participate in pointer-drag ownership. */
+    /* RFB buttons 4-7 (mask bits 3-6) are wheel up/down/left/right; inject
+     * on the press edge, independent of pointer-drag ownership. */
     int wheel_buttons = button_mask & 0x78;
     int wheel_pressed = wheel_buttons & ~state->previous_wheel_buttons;
     state->previous_wheel_buttons = wheel_buttons;
@@ -866,10 +832,8 @@ static void keyboard_event(rfbBool down, rfbKeySym key, rfbClientPtr client) {
         uint8_t message[14] = {0};
         message[0] = SCRCPY_MSG_INJECT_KEYCODE;
         message[1] = down ? 0 : 1;
-        write_u32be(message + 2, (uint32_t) keycode);
-        pthread_mutex_lock(&control_mutex);
-        send_all(control_fd, message, sizeof(message));
-        pthread_mutex_unlock(&control_mutex);
+        AV_WB32(message + 2, (uint32_t) keycode);
+        send_control(message, sizeof(message));
         return;
     }
 
@@ -894,10 +858,8 @@ static void keyboard_event(rfbBool down, rfbKeySym key, rfbClientPtr client) {
         return;
     }
     message[0] = SCRCPY_MSG_INJECT_TEXT;
-    write_u32be(message + 1, (uint32_t) length);
-    pthread_mutex_lock(&control_mutex);
-    send_all(control_fd, message, 5 + length);
-    pthread_mutex_unlock(&control_mutex);
+    AV_WB32(message + 1, (uint32_t) length);
+    send_control(message, 5 + length);
 }
 
 static int is_h264_encoding(int encoding) {
@@ -921,7 +883,7 @@ static void describe_scroll_rows(const uint8_t *frame, int width, int height,
     int x1 = width / 10;
     int span = width - 2 * x1;
 
-    memset(rows, 0, (size_t) height * sizeof(*rows));
+    /* Rows outside [top,bottom) are never read, so no zero-fill needed */
     for (int y = top; y < bottom; ++y) {
         unsigned minimum = 255;
         unsigned maximum = 0;
@@ -986,8 +948,10 @@ static int detect_vertical_scroll(const uint8_t *old_frame,
         return 0;
     }
 
-    struct scroll_row *old_rows = calloc((size_t) height, sizeof(*old_rows));
-    struct scroll_row *new_rows = calloc((size_t) height, sizeof(*new_rows));
+    struct scroll_row *old_rows = malloc((size_t) height * sizeof(*old_rows));
+    struct scroll_row *new_rows = malloc((size_t) height * sizeof(*new_rows));
+    /* scores/matches stay zeroed: the |dy| < SCROLL_MIN_SHIFT band is
+     * skipped by the scoring loop but still read when picking the best */
     int *scores = calloc((size_t) (2 * maximum_shift + 1), sizeof(*scores));
     int *matches = calloc((size_t) (2 * maximum_shift + 1), sizeof(*matches));
     if (!old_rows || !new_rows || !scores || !matches) {
@@ -1161,10 +1125,9 @@ static void adapt_client_jpeg(rfbClientPtr client,
 }
 
 /* Publish only pixels that differ from the last stable framebuffer. The
- * decoder thread intentionally owns a single pending fallback buffer: when
- * VNC output is slower than Android, swscale replaces that pending image and
- * this function publishes the newest image instead of replaying stale decoded
- * frames. */
+ * decoder owns a single pending buffer on purpose: when VNC output is slower
+ * than Android, the newest image replaces the pending one instead of stale
+ * decoded frames queueing up. */
 static size_t publish_latest_fallback_frame(struct damage_rect *rects,
                                             size_t rect_capacity,
                                             int enable_copyrect,
@@ -1312,11 +1275,9 @@ static void display_hook(rfbClientPtr client) {
         return;
     }
 
-    /* Ordinary clients should work with their defaults. Do not advertise a
-     * resizeable desktop: this bridge has a fixed-size scrcpy session, and
-     * several viewers terminate when their automatic SetDesktopSize request
-     * is rejected. H.264 clients retain the extension and explicitly opt out
-     * of remote resize because their integration is already specialized. */
+    /* Do not advertise a resizeable desktop: the scrcpy session size is
+     * fixed and several viewers terminate when their automatic
+     * SetDesktopSize request is rejected. */
     client->useExtDesktopSize = FALSE;
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
@@ -1349,7 +1310,6 @@ static void display_hook(rfbClientPtr client) {
     pthread_rwlock_rdlock(&screen_buffer_lock);
     pthread_mutex_lock(&metrics_mutex);
     clock_gettime(CLOCK_MONOTONIC, &state->ordinary_update_started);
-    state->ordinary_update_timer_active = 1;
     pthread_mutex_unlock(&metrics_mutex);
     state->framebuffer_lock_held = 1;
 }
@@ -1361,16 +1321,13 @@ static void display_finished_hook(rfbClientPtr client, int result) {
         struct timespec finished;
         clock_gettime(CLOCK_MONOTONIC, &finished);
         pthread_mutex_lock(&metrics_mutex);
-        if (state->ordinary_update_timer_active) {
-            uint64_t sample = elapsed_us(&state->ordinary_update_started,
-                                         &finished);
-            if (!state->ordinary_update_us_ema) {
-                state->ordinary_update_us_ema = sample;
-            } else {
-                state->ordinary_update_us_ema =
-                        (state->ordinary_update_us_ema * 3 + sample) / 4;
-            }
-            state->ordinary_update_timer_active = 0;
+        uint64_t sample = elapsed_us(&state->ordinary_update_started,
+                                     &finished);
+        if (!state->ordinary_update_us_ema) {
+            state->ordinary_update_us_ema = sample;
+        } else {
+            state->ordinary_update_us_ema =
+                    (state->ordinary_update_us_ema * 3 + sample) / 4;
         }
         pthread_mutex_unlock(&metrics_mutex);
         state->framebuffer_lock_held = 0;
@@ -1422,19 +1379,19 @@ static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s [options] [libvncserver options]\n"
             "\n"
-            "  --scrcpy-host addr   scrcpy server IPv4 address (default 127.0.0.1)\n"
-            "  --scrcpy-port port   scrcpy server TCP port (default 27183)\n"
+            "  --scrcpy-host addr   scrcpy server IPv4 address (default %s)\n"
+            "  --scrcpy-port port   scrcpy server TCP port (default %d)\n"
             "  --self-test          run built-in self tests and exit\n"
             "  --help               show this help\n"
             "\n"
             "libvncserver options (-listen, -rfbport, -passwd, -rfbauth, ...):\n",
-            program);
+            program, SCRCPY_DEFAULT_HOST, SCRCPY_DEFAULT_PORT);
     rfbUsage();
 }
 
 int main(int argc, char **argv) {
-    const char *scrcpy_host = "127.0.0.1";
-    uint16_t scrcpy_port = 27183;
+    const char *scrcpy_host = SCRCPY_DEFAULT_HOST;
+    uint16_t scrcpy_port = SCRCPY_DEFAULT_PORT;
 
     for (int i = 1; i < argc;) {
         if (strcmp(argv[i], "--self-test") == 0) {
@@ -1490,17 +1447,17 @@ int main(int argc, char **argv) {
     uint8_t codec_header[4];
     uint8_t session_header[12];
     if (recv_all(video_fd, codec_header, sizeof(codec_header)) <= 0
-            || read_u32be(codec_header) != SCRCPY_CODEC_H264) {
+            || AV_RB32(codec_header) != SCRCPY_CODEC_H264) {
         fprintf(stderr, "scrcpy did not negotiate H.264\n");
         return 1;
     }
     if (recv_all(video_fd, session_header, sizeof(session_header)) <= 0
-            || !(read_u64be(session_header) & SCRCPY_PACKET_FLAG_SESSION)) {
+            || !(AV_RB64(session_header) & SCRCPY_PACKET_FLAG_SESSION)) {
         fprintf(stderr, "missing initial scrcpy session metadata\n");
         return 1;
     }
-    video_width = (int) read_u32be(session_header + 4);
-    video_height = (int) read_u32be(session_header + 8);
+    video_width = (int) AV_RB32(session_header + 4);
+    video_height = (int) AV_RB32(session_header + 8);
     fprintf(stderr, "scrcpy H.264 stream: %dx%d\n", video_width, video_height);
 
     framebuffer_size = (size_t) video_width * (size_t) video_height * 4;

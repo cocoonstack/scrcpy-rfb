@@ -30,12 +30,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build builder image (cached FFmpeg layer)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.builder
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: scrcpy-rfb-builder:${{ matrix.arch }}
+          cache-from: type=gha,scope=builder-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=builder-${{ matrix.arch }}
+
       - name: Build Ubuntu 22.04 binary
         run: |
-          docker build \
-            --platform "${{ matrix.platform }}" \
-            -t "scrcpy-rfb-builder:${{ matrix.arch }}" \
-            -f docker/Dockerfile.builder .
           docker run --rm \
             --platform "${{ matrix.platform }}" \
             -v "$PWD:/src" \
@@ -72,6 +81,7 @@ jobs:
 
       - name: Generate build metadata
         run: |
+          ffmpeg_commit=$(sed -n 's/^ARG FFMPEG_COMMIT=//p' docker/Dockerfile.builder)
           cat > dist/build-info.json <<EOF
           {
             "ref": "${GITHUB_REF_NAME}",
@@ -79,7 +89,7 @@ jobs:
             "run_id": "${GITHUB_RUN_ID}",
             "run_attempt": "${GITHUB_RUN_ATTEMPT}",
             "workflow": "${GITHUB_WORKFLOW}",
-            "ffmpeg_commit": "998de74adf861c26df557e220996faa959419549"
+            "ffmpeg_commit": "${ffmpeg_commit}"
           }
           EOF
 
