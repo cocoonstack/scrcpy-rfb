@@ -11,7 +11,9 @@
 # gone), so the two edits are:
 #   1. DisplayManager.createVirtualDisplay(name,w,h,displayId,surface) — the hidden
 #      5-arg mirror wrapper — is redirected to the public 6-arg createNewVirtualDisplay
-#      with flags 0x14 (SECURE|AUTO_MIRROR); AUTO_MIRROR tracks the default display.
+#      with flags 0x14 (SECURE|AUTO_MIRROR). AUTO_MIRROR always tracks the default
+#      display, so the displayId argument is dropped (the ReDroid farm only uses
+#      display 0; a non-default display_id would be ignored).
 #   2. FakeContext package "com.android.shell" -> "android", or the secure
 #      createVirtualDisplay binder call fails "packageName must match the calling uid".
 #
