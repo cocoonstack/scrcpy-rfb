@@ -59,12 +59,21 @@ jobs:
           test -x "$artifact"
           grep -F "scrcpy-rfb-linux-${{ matrix.arch }}" "$artifact.sha256"
 
+      - name: Build su1000 helper (runs the scrcpy server as the system uid)
+        run: |
+          su1000="dist/su1000-linux-${{ matrix.arch }}"
+          gcc -static -O2 -s -o "$su1000" server/su1000.c
+          file "$su1000"
+          ( cd dist && sha256sum "su1000-linux-${{ matrix.arch }}" > "su1000-linux-${{ matrix.arch }}.sha256" )
+
       - uses: actions/upload-artifact@v7
         with:
           name: scrcpy-rfb-linux-${{ matrix.arch }}
           path: |
             dist/scrcpy-rfb-linux-${{ matrix.arch }}
             dist/scrcpy-rfb-linux-${{ matrix.arch }}.sha256
+            dist/su1000-linux-${{ matrix.arch }}
+            dist/su1000-linux-${{ matrix.arch }}.sha256
 
   release:
     name: Update master prerelease
@@ -95,6 +104,16 @@ jobs:
           }
           EOF
 
+      - name: Build patched scrcpy-server (secure FLAG_SECURE mirror)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends smali default-jre-headless python3 unzip zip
+          curl -fsSL https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1 \
+            -o dist/scrcpy-server-secure.jar
+          echo "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae  dist/scrcpy-server-secure.jar" | sha256sum -c -
+          bash server/patch-scrcpy-secure.sh dist/scrcpy-server-secure.jar
+          ( cd dist && sha256sum scrcpy-server-secure.jar > scrcpy-server-secure.jar.sha256 )
+
       - name: Create master release
         uses: softprops/action-gh-release@v3
         with:
@@ -110,6 +129,12 @@ jobs:
             dist/scrcpy-rfb-linux-amd64.sha256
             dist/scrcpy-rfb-linux-arm64
             dist/scrcpy-rfb-linux-arm64.sha256
+            dist/su1000-linux-amd64
+            dist/su1000-linux-amd64.sha256
+            dist/su1000-linux-arm64
+            dist/su1000-linux-arm64.sha256
+            dist/scrcpy-server-secure.jar
+            dist/scrcpy-server-secure.jar.sha256
             dist/build-info.json
           prerelease: true
           make_latest: false
