@@ -40,6 +40,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: scrcpy-rfb-builder:${{ matrix.arch }}
+          build-args: |
+            UBUNTU_PORTS_MIRROR=http://mirror.us.leaseweb.net/ubuntu-ports
           cache-from: type=gha,scope=builder-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=builder-${{ matrix.arch }}
 
@@ -153,6 +155,8 @@ jobs:
           file: docker/Dockerfile.runtime
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            UBUNTU_PORTS_MIRROR=http://mirror.us.leaseweb.net/ubuntu-ports
           tags: |
             ghcr.io/${{ github.repository }}:master
             ghcr.io/${{ github.repository }}:${{ github.sha }}

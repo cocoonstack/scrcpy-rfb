@@ -1,9 +1,10 @@
 FROM ubuntu:22.04
 
 ARG TARGETARCH
+ARG UBUNTU_PORTS_MIRROR=http://ports.ubuntu.com/ubuntu-ports
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN sed -i 's|http://ports.ubuntu.com|http://azure.ports.ubuntu.com|g' /etc/apt/sources.list \
+RUN sed -i "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" /etc/apt/sources.list \
     && echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries \
     && apt-get update \
     && apt-get install -y --no-install-recommends libjpeg-turbo8 zlib1g \
