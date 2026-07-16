@@ -1,0 +1,428 @@
+From 4435612cca183e82fa01f14c85f7ce586d2ed93e Mon Sep 17 00:00:00 2001
+From: CMGS <ilskdw@gmail.com>
+Date: Thu, 16 Jul 2026 14:59:44 +0800
+Subject: [PATCH 2/2] libvncserver: add server-side support for the Open H.264
+ encoding
+
+Add support for the Open H.264 encoding (50) implemented by the TigerVNC
+and noVNC viewers. The server does not encode: the application supplies
+pre-encoded H.264 access units through a new per-screen hook, making the
+encoding suitable for passing through streams that already exist in
+H.264 form (hardware encoders, Android screen capture, media pipelines).
+
+The hook contract is non-blocking. When a new access unit is available,
+the application calls rfbNotifyH264FrameAvailable(), which wakes only
+the clients streaming H.264, so damage tracking of clients using other
+encodings is not disturbed. This works with both the threaded and the
+select()-based event loops and never blocks the update path while
+holding the client's send mutex. The access unit is fetched only after
+the wake-up mark has been consumed, so a notification racing a running
+update is never lost.
+
+Since a video stream is push-oriented, a client whose preferred encoding
+is Open H.264 keeps its update subscription instead of needing one
+framebuffer update request per frame. Its whole modified region is
+dropped after each update - pixel damage is superseded by the next
+access unit - so a client whose update requests never covered the full
+screen cannot leave residue that would spin the update loop.
+
+Access units routinely exceed UPDATE_BUF_SIZE, so the rectangle payload
+is written directly to the socket. New rfbScreenInfo/rfbClientRec fields
+are appended to the end of the structs to keep the ABI
+backward-compatible.
+---
+ include/rfb/rfb.h            |  33 +++++++
+ include/rfb/rfbproto.h       |   3 +
+ src/libvncserver/main.c      |  20 +++++
+ src/libvncserver/rfbserver.c | 164 +++++++++++++++++++++++++++++++++--
+ src/libvncserver/stats.c     |   1 +
+ 5 files changed, 212 insertions(+), 9 deletions(-)
+
+diff --git a/include/rfb/rfb.h b/include/rfb/rfb.h
+index e225c034..90b4aec7 100644
+--- a/include/rfb/rfb.h
++++ b/include/rfb/rfb.h
+@@ -113,6 +113,24 @@ typedef rfbBool (*rfbPasswordCheckProcPtr)(struct _rfbClientRec* cl,const char*
+ typedef enum rfbNewClientAction (*rfbNewClientHookPtr)(struct _rfbClientRec* cl);
+ typedef void (*rfbDisplayHookPtr)(struct _rfbClientRec* cl);
+ typedef void (*rfbDisplayFinishedHookPtr)(struct _rfbClientRec* cl, int result);
++/**
++ * Return the next H.264 access unit to send to a client that selected the
++ * Open H.264 encoding, or FALSE if no new access unit is available for this
++ * client right now.
++ *
++ * The hook must not block: it is called from the client's update path.
++ * Whenever a new access unit becomes available, call
++ * rfbNotifyH264FrameAvailable() to trigger another framebuffer update.
++ *
++ * On success, store a malloc()ed buffer in @p frame; LibVNCServer takes
++ * ownership and frees it after sending. The hook is called independently for
++ * every client, so keep a per-client stream position in cl->clientData. Each
++ * client's stream must be self-contained, i.e. start with SPS/PPS parameter
++ * sets followed by an IDR frame.
++ */
++typedef rfbBool (*rfbGetH264FrameHookPtr)(struct _rfbClientRec* cl,
++                                          char** frame,
++                                          size_t* frameSize);
+ /** support the capability to view the caps/num/scroll states of the X server */
+ typedef int  (*rfbGetKeyboardLedStateHookPtr)(struct _rfbScreenInfo* screen);
+ typedef rfbBool (*rfbXvpHookPtr)(struct _rfbClientRec* cl, uint8_t, uint8_t);
+@@ -386,6 +404,9 @@ typedef struct _rfbScreenInfo
+      * its listening sockets from the current listenInterface/listen6Interface/
+      * port/ipv6port values on its next loop iteration. Cleared by the thread. */
+     rfbBool rebindListenSockets;
++    /** Optional source of pre-encoded H.264 access units. Setting this hook
++     * enables the Open H.264 encoding. See rfbGetH264FrameHookPtr. */
++    rfbGetH264FrameHookPtr getH264FrameHook;
+ } rfbScreenInfo, *rfbScreenInfoPtr;
+ 
+ 
+@@ -740,6 +761,11 @@ typedef struct _rfbClientRec {
+     ClientPeekAtSocket peekAtSocket;             /* Peek at data from socket */
+     ClientHasPendingOnSocket hasPendingOnSocket; /* Has pending data on socket */
+     ClientWriteToSocket writeToSocket;           /* Write data to socket */
++
++    /** TRUE if the client advertised the Open H.264 encoding and the screen
++     * has a getH264FrameHook. Applications can use this to recognize
++     * H.264-capable clients that selected another encoding. */
++    rfbBool supportsH264Encoding;
+ } rfbClientRec, *rfbClientPtr;
+ 
+ /**
+@@ -862,6 +888,7 @@ extern void rfbClientConnFailed(rfbClientPtr cl, const char *reason);
+ extern void rfbNewUDPConnection(rfbScreenInfoPtr rfbScreen,rfbSocket sock);
+ extern void rfbProcessUDPInput(rfbScreenInfoPtr rfbScreen);
+ extern rfbBool rfbSendFramebufferUpdate(rfbClientPtr cl, sraRegionPtr updateRegion);
++extern rfbBool rfbSendRectEncodingOpenH264(rfbClientPtr cl, const char *frame, size_t frameSize);
+ extern rfbBool rfbSendRectEncodingRaw(rfbClientPtr cl, int x,int y,int w,int h);
+ extern rfbBool rfbSendUpdateBuf(rfbClientPtr cl);
+ extern void rfbSendServerCutText(rfbScreenInfoPtr rfbScreen,char *str, int len);
+@@ -1090,6 +1117,12 @@ void rfbDoCopyRegion(rfbScreenInfoPtr rfbScreen,sraRegionPtr copyRegion,int dx,i
+ 
+ void rfbMarkRectAsModified(rfbScreenInfoPtr rfbScreen,int x1,int y1,int x2,int y2);
+ void rfbMarkRegionAsModified(rfbScreenInfoPtr rfbScreen,sraRegionPtr modRegion);
++/** Wake all clients streaming via the Open H.264 encoding because a new
++ * access unit can be fetched through getH264FrameHook. Clients using other
++ * encodings are not disturbed. With the threaded event loop this may be
++ * called from any thread; an application driving rfbProcessEvents() itself
++ * should call it from that same thread. */
++void rfbNotifyH264FrameAvailable(rfbScreenInfoPtr rfbScreen);
+ void rfbDoNothingWithClient(rfbClientPtr cl);
+ enum rfbNewClientAction defaultNewClientHook(rfbClientPtr cl);
+ void rfbRegisterProtocolExtension(rfbProtocolExtension* extension);
+diff --git a/include/rfb/rfbproto.h b/include/rfb/rfbproto.h
+index ebcd303c..4bd178b7 100644
+--- a/include/rfb/rfbproto.h
++++ b/include/rfb/rfbproto.h
+@@ -460,6 +460,9 @@ typedef struct {
+ #define rfbEncodingZRLE 16
+ #define rfbEncodingZYWRLE 17
+ 
++/* Open H.264 encoding, as implemented by the TigerVNC and noVNC viewers */
++#define rfbEncodingOpenH264 50
++
+ #define rfbEncodingH264               0x48323634
+ 
+ /* Cache & XOR-Zlib - rdv@2002 */
+diff --git a/src/libvncserver/main.c b/src/libvncserver/main.c
+index d2c7aff1..803715d4 100644
+--- a/src/libvncserver/main.c
++++ b/src/libvncserver/main.c
+@@ -425,6 +425,26 @@ void rfbMarkRegionAsModified(rfbScreenInfoPtr screen,sraRegionPtr modRegion)
+    rfbReleaseClientIterator(iterator);
+ }
+ 
++void rfbNotifyH264FrameAvailable(rfbScreenInfoPtr screen)
++{
++   rfbClientIteratorPtr iterator;
++   rfbClientPtr cl;
++   sraRegionPtr region = sraRgnCreateRect(0,0,screen->width,screen->height);
++
++   iterator=rfbGetClientIterator(screen);
++   while((cl=rfbClientIteratorNext(iterator))) {
++     if(cl->preferredEncoding != rfbEncodingOpenH264)
++       continue;
++     LOCK(cl->updateMutex);
++     sraRgnOr(cl->modifiedRegion,region);
++     TSIGNAL(cl->updateCond);
++     UNLOCK(cl->updateMutex);
++   }
++
++   rfbReleaseClientIterator(iterator);
++   sraRgnDestroy(region);
++}
++
+ void rfbScaledScreenUpdate(rfbScreenInfoPtr screen, int x1, int y1, int x2, int y2);
+ void rfbMarkRectAsModified(rfbScreenInfoPtr screen,int x1,int y1,int x2,int y2)
+ {
+diff --git a/src/libvncserver/rfbserver.c b/src/libvncserver/rfbserver.c
+index 5cb42654..ae405624 100644
+--- a/src/libvncserver/rfbserver.c
++++ b/src/libvncserver/rfbserver.c
+@@ -2389,6 +2389,7 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
+ 
+         /* Reset all flags to defaults (allows us to switch between PointerPos and Server Drawn Cursors) */
+         cl->preferredEncoding=-1;
++        cl->supportsH264Encoding     = FALSE;
+         cl->useCopyRect              = FALSE;
+         cl->useNewFBSize             = FALSE;
+         cl->useExtDesktopSize        = FALSE;
+@@ -2447,6 +2448,14 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
+ 
+ 
+                 break;
++	    case rfbEncodingOpenH264:
++		/* Only usable when the application supplies encoded frames */
++		if (cl->screen->getH264FrameHook == NULL)
++		    break;
++		cl->supportsH264Encoding = TRUE;
++		if (cl->preferredEncoding == -1)
++		    cl->preferredEncoding = enc;
++		break;
+ 	    case rfbEncodingXCursor:
+ 		if(!cl->screen->dontConvertRichCursorToXCursor) {
+ 		    rfbLog("Enabling X-style cursor updates for client %s\n",
+@@ -3203,7 +3212,10 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+     rfbBool sendSupportedEncodings = FALSE;
+     rfbBool sendServerIdentity = FALSE;
+     rfbBool result = TRUE;
+-    
++    rfbBool streamingOpenH264 = FALSE;
++    char *h264Frame = NULL;
++    size_t h264FrameSize = 0;
++
+ 
+     if(cl->screen->displayHook)
+       cl->screen->displayHook(cl);
+@@ -3305,6 +3317,14 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+         cl->enableServerIdentity = FALSE;
+     }
+ 
++    /*
++     * The Open H.264 encoding is stream-oriented: instead of encoding
++     * modified framebuffer regions, each update carries the next pre-encoded
++     * access unit obtained from the getH264FrameHook.
++     */
++    streamingOpenH264 = cl->preferredEncoding == rfbEncodingOpenH264 &&
++        cl->screen->getH264FrameHook != NULL;
++
+     LOCK(cl->updateMutex);
+ 
+     /*
+@@ -3346,6 +3366,7 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+     sraRgnOr(updateRegion,cl->copyRegion);
+     if(!sraRgnAnd(updateRegion,cl->requestedRegion) &&
+        sraRgnEmpty(updateRegion) &&
++       !streamingOpenH264 &&
+        (cl->enableCursorShapeUpdates ||
+ 	(cl->cursorX == cl->screen->cursorX && cl->cursorY == cl->screen->cursorY)) &&
+        !sendCursorShape && !sendCursorPos && !sendKeyboardLedState &&
+@@ -3375,6 +3396,14 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+     dx = cl->copyDX;
+     dy = cl->copyDY;
+ 
++    /*
++     * CopyRect makes no sense within an H.264 stream: every access unit
++     * repaints the full rectangle anyway, so fold any scheduled copies into
++     * the ordinary update region.
++     */
++    if (streamingOpenH264)
++        sraRgnMakeEmpty(updateCopyRegion);
++
+     /*
+      * Next we remove updateCopyRegion from updateRegion so that updateRegion
+      * is the part of this update which is sent as ordinary pixel data (i.e not
+@@ -3390,17 +3419,60 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+      * carry over a copyRegion for a future update.
+      */
+ 
+-     sraRgnOr(cl->modifiedRegion,cl->copyRegion);
+-     sraRgnSubtract(cl->modifiedRegion,updateRegion);
+-     sraRgnSubtract(cl->modifiedRegion,updateCopyRegion);
+-
+-     sraRgnMakeEmpty(cl->requestedRegion);
++     if (streamingOpenH264) {
++         /*
++          * Any pixel damage is superseded by the next access unit, so drop
++          * the whole modified region rather than subtracting updateRegion,
++          * which is bounded by the client's requested region: a client whose
++          * requests never covered the full screen would otherwise leave
++          * residue that keeps the update loop spinning. The client also
++          * keeps its streaming subscription (requestedRegion): new access
++          * units are pushed via rfbNotifyH264FrameAvailable() without one
++          * framebuffer update request per frame.
++          */
++         sraRgnMakeEmpty(cl->modifiedRegion);
++     } else {
++         sraRgnOr(cl->modifiedRegion,cl->copyRegion);
++         sraRgnSubtract(cl->modifiedRegion,updateRegion);
++         sraRgnSubtract(cl->modifiedRegion,updateCopyRegion);
++
++         sraRgnMakeEmpty(cl->requestedRegion);
++     }
+      sraRgnMakeEmpty(cl->copyRegion);
+      cl->copyDX = 0;
+      cl->copyDY = 0;
+-   
++
+      UNLOCK(cl->updateMutex);
+-   
++
++    /*
++     * Fetch the access unit only after the wake-up mark has been consumed
++     * above: a rfbNotifyH264FrameAvailable() arriving from here on re-marks
++     * the modified region and triggers the next update, while one that
++     * arrived earlier already made its access unit visible to this fetch.
++     * The hook must not block. It is called per client, outside updateMutex.
++     */
++    if (streamingOpenH264) {
++        if (!cl->screen->getH264FrameHook(cl, &h264Frame, &h264FrameSize) ||
++            h264Frame == NULL || h264FrameSize == 0) {
++            free(h264Frame);
++            h264Frame = NULL;
++        }
++        if (h264Frame == NULL &&
++            (cl->enableCursorShapeUpdates ||
++             (cl->cursorX == cl->screen->cursorX &&
++              cl->cursorY == cl->screen->cursorY)) &&
++            !sendCursorShape && !sendCursorPos && !sendKeyboardLedState &&
++            !sendSupportedMessages && !sendSupportedEncodings &&
++            !sendServerIdentity) {
++            /* Nothing to send: the wake-up raced ahead of the frame source */
++            sraRgnDestroy(updateRegion);
++            sraRgnDestroy(updateCopyRegion);
++            if(cl->screen->displayFinishedHook)
++                cl->screen->displayFinishedHook(cl, TRUE);
++            return TRUE;
++        }
++    }
++
+     if (!cl->enableCursorShapeUpdates) {
+       if(cl->cursorX != cl->screen->cursorX || cl->cursorY != cl->screen->cursorY) {
+ 	rfbRedrawAfterHideCursor(cl,updateRegion);
+@@ -3418,7 +3490,10 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+      */
+     
+     rfbStatRecordMessageSent(cl, rfbFramebufferUpdate, 0, 0);
+-    if (cl->preferredEncoding == rfbEncodingCoRRE) {
++    if (streamingOpenH264) {
++        /* One full-frame rectangle per access unit, none if no new frame */
++        nUpdateRegionRects = h264Frame != NULL ? 1 : 0;
++    } else if (cl->preferredEncoding == rfbEncodingCoRRE) {
+         nUpdateRegionRects = 0;
+ 
+         for(i = sraRgnGetIterator(updateRegion); sraRgnIteratorNext(i,&rect);){
+@@ -3582,6 +3657,11 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+ 	        goto updateFailed;
+     }
+ 
++    if (streamingOpenH264) {
++        if (h264Frame != NULL &&
++            !rfbSendRectEncodingOpenH264(cl, h264Frame, h264FrameSize))
++            goto updateFailed;
++    } else
+     for(i = sraRgnGetIterator(updateRegion); sraRgnIteratorNext(i,&rect);){
+         int x = rect.x1;
+         int y = rect.y1;
+@@ -3595,6 +3675,10 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
+         switch (cl->preferredEncoding) {
+ 	case -1:
+         case rfbEncodingRaw:
++        /* An Open H.264 client can only reach the generic loop if the
++         * application removed getH264FrameHook at runtime; degrade to Raw
++         * instead of sending a header whose rectangles never follow. */
++        case rfbEncodingOpenH264:
+             if (!rfbSendRectEncodingRaw(cl, x, y, w, h))
+ 	        goto updateFailed;
+             break;
+@@ -3657,6 +3741,7 @@ updateFailed:
+       rfbHideCursor(cl);
+     }
+ 
++    free(h264Frame);
+     if(i)
+         sraRgnReleaseIterator(i);
+     sraRgnDestroy(updateRegion);
+@@ -3668,6 +3753,67 @@ updateFailed:
+ }
+ 
+ 
++/*
++ * Send one full-frame rectangle in the Open H.264 encoding. The rectangle
++ * payload is a header of two big-endian uint32 values, the access unit
++ * length and the decoder reset flags, followed by one complete H.264 access
++ * unit. Access units routinely exceed UPDATE_BUF_SIZE, so the payload is
++ * written directly to the socket instead of going through updateBuf.
++ */
++
++rfbBool
++rfbSendRectEncodingOpenH264(rfbClientPtr cl,
++                            const char *frame,
++                            size_t frameSize)
++{
++    rfbFramebufferUpdateRectHeader rect;
++    char *packet;
++    size_t packetSize;
++    uint32_t value;
++
++    if (frame == NULL || frameSize == 0 || frameSize > UINT32_MAX ||
++        frameSize > SIZE_MAX - sz_rfbFramebufferUpdateRectHeader - 8)
++        return FALSE;
++
++    packetSize = sz_rfbFramebufferUpdateRectHeader + 8 + frameSize;
++    if (packetSize > INT_MAX)
++        return FALSE;
++
++    packet = (char *)malloc(packetSize);
++    if (packet == NULL)
++        return FALSE;
++
++    rect.r.x = 0;
++    rect.r.y = 0;
++    rect.r.w = Swap16IfLE(cl->screen->width);
++    rect.r.h = Swap16IfLE(cl->screen->height);
++    rect.encoding = Swap32IfLE(rfbEncodingOpenH264);
++    memcpy(packet, &rect, sz_rfbFramebufferUpdateRectHeader);
++
++    value = Swap32IfLE((uint32_t)frameSize);
++    memcpy(packet + sz_rfbFramebufferUpdateRectHeader, &value, sizeof(value));
++    value = 0;
++    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 4, &value,
++           sizeof(value));
++    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 8, frame, frameSize);
++
++    if (!rfbSendUpdateBuf(cl) ||
++        rfbWriteExact(cl, packet, (int)packetSize) < 0) {
++        free(packet);
++        return FALSE;
++    }
++    free(packet);
++
++    rfbStatRecordEncodingSent(cl, rfbEncodingOpenH264,
++                              (int)packetSize,
++                              sz_rfbFramebufferUpdateRectHeader +
++                              cl->screen->width *
++                              (cl->format.bitsPerPixel / 8) *
++                              cl->screen->height);
++    return TRUE;
++}
++
++
+ /*
+  * Send the copy region as a string of CopyRect encoded rectangles.
+  * The only slightly tricky thing is that we should send the messages in
+diff --git a/src/libvncserver/stats.c b/src/libvncserver/stats.c
+index 8af04e3f..c2b339ec 100644
+--- a/src/libvncserver/stats.c
++++ b/src/libvncserver/stats.c
+@@ -106,6 +106,7 @@ char *encodingName(uint32_t type, char *buf, int len) {
+     case rfbEncodingUltra:              snprintf(buf, len, "ultra");       break;
+     case rfbEncodingZRLE:               snprintf(buf, len, "ZRLE");        break;
+     case rfbEncodingZYWRLE:             snprintf(buf, len, "ZYWRLE");      break;
++    case rfbEncodingOpenH264:           snprintf(buf, len, "OpenH264");    break;
+     case rfbEncodingCache:              snprintf(buf, len, "cache");       break;
+     case rfbEncodingCacheEnable:        snprintf(buf, len, "cacheEnable"); break;
+     case rfbEncodingXOR_Zlib:           snprintf(buf, len, "xorZlib");     break;
+-- 
+2.54.0
+

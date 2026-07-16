@@ -1,0 +1,14 @@
+FROM ubuntu:22.04
+
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libjpeg-turbo8 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/scrcpy-rfb-linux-${TARGETARCH} /usr/local/bin/scrcpy-rfb
+RUN chmod +x /usr/local/bin/scrcpy-rfb
+
+EXPOSE 5900
+ENTRYPOINT ["/usr/local/bin/scrcpy-rfb"]
