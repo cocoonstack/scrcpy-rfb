@@ -61,6 +61,8 @@ jobs:
 
       - name: Build su1000 helper (runs the scrcpy server as the system uid)
         run: |
+          # The builder container writes dist/ as root; take it back so gcc (runner user) can write.
+          sudo chown -R "$(id -u):$(id -g)" dist
           su1000="dist/su1000-linux-${{ matrix.arch }}"
           gcc -static -O2 -s -o "$su1000" server/su1000.c
           file "$su1000"
