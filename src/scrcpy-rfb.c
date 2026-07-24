@@ -44,6 +44,7 @@
 #define SCRCPY_MSG_INJECT_TEXT 1
 #define SCRCPY_MSG_INJECT_TOUCH 2
 #define SCRCPY_MSG_INJECT_SCROLL 3
+#define SCRCPY_MSG_SET_DISPLAY_POWER 10
 #define SCRCPY_MSG_RESET_VIDEO 17
 
 #define FRAME_QUEUE_CAPACITY 90
@@ -92,6 +93,14 @@ struct damage_rect {
 struct scroll_row {
     uint8_t luma[SCROLL_ROW_SAMPLES];
     uint8_t informative;
+};
+
+struct bridge_options {
+    const char *scrcpy_host;
+    uint16_t scrcpy_port;
+    int turn_screen_off;
+    int self_test;
+    int help;
 };
 
 static struct frame frame_queue[FRAME_QUEUE_CAPACITY];
@@ -218,6 +227,64 @@ static int connect_tcp(const char *host, uint16_t port) {
     return -1;
 }
 
+static void remove_arguments(int *argc, char **argv, int index, int count) {
+    memmove(argv + index, argv + index + count,
+            (size_t) (*argc - index - count + 1) * sizeof(*argv));
+    *argc -= count;
+}
+
+static int parse_bridge_options(int *argc, char **argv,
+                                struct bridge_options *options) {
+    *options = (struct bridge_options) {
+        .scrcpy_host = SCRCPY_DEFAULT_HOST,
+        .scrcpy_port = SCRCPY_DEFAULT_PORT,
+    };
+
+    for (int i = 1; i < *argc;) {
+        if (strcmp(argv[i], "--turn-screen-off") == 0) {
+            options->turn_screen_off = 1;
+            remove_arguments(argc, argv, i, 1);
+            continue;
+        }
+        if (strcmp(argv[i], "--self-test") == 0) {
+            options->self_test = 1;
+            remove_arguments(argc, argv, i, 1);
+            continue;
+        }
+        if (strcmp(argv[i], "--help") == 0) {
+            options->help = 1;
+            remove_arguments(argc, argv, i, 1);
+            continue;
+        }
+        if (strcmp(argv[i], "--scrcpy-host") == 0) {
+            if (i + 1 >= *argc) {
+                fprintf(stderr, "--scrcpy-host requires an address\n");
+                return -1;
+            }
+            options->scrcpy_host = argv[i + 1];
+            remove_arguments(argc, argv, i, 2);
+            continue;
+        }
+        if (strcmp(argv[i], "--scrcpy-port") == 0) {
+            if (i + 1 >= *argc) {
+                fprintf(stderr, "--scrcpy-port requires a port\n");
+                return -1;
+            }
+            char *end;
+            long port = strtol(argv[i + 1], &end, 10);
+            if (!argv[i + 1][0] || *end || port <= 0 || port > 65535) {
+                fprintf(stderr, "invalid scrcpy port: %s\n", argv[i + 1]);
+                return -1;
+            }
+            options->scrcpy_port = (uint16_t) port;
+            remove_arguments(argc, argv, i, 2);
+            continue;
+        }
+        ++i;
+    }
+    return 0;
+}
+
 static void free_frame(struct frame *frame) {
     free(frame->data);
     memset(frame, 0, sizeof(*frame));
@@ -248,6 +315,17 @@ static int send_control(const void *message, size_t size) {
     int result = send_all(control_fd, message, size);
     pthread_mutex_unlock(&control_mutex);
     return result;
+}
+
+static void encode_display_power(uint8_t message[2], int on) {
+    message[0] = SCRCPY_MSG_SET_DISPLAY_POWER;
+    message[1] = on ? 1 : 0;
+}
+
+static int send_display_power(int on) {
+    uint8_t message[2];
+    encode_display_power(message, on);
+    return send_control(message, sizeof(message));
 }
 
 /* Ask scrcpy for a fresh config packet and keyframe. Unless forced, at most
@@ -1082,6 +1160,45 @@ static int run_self_test(void) {
         return 1;
     }
 
+    uint8_t display_power[2];
+    encode_display_power(display_power, 0);
+    if (display_power[0] != SCRCPY_MSG_SET_DISPLAY_POWER
+            || display_power[1] != 0) {
+        fprintf(stderr, "display power off message self-test failed\n");
+        return 1;
+    }
+    encode_display_power(display_power, 1);
+    if (display_power[0] != SCRCPY_MSG_SET_DISPLAY_POWER
+            || display_power[1] != 1) {
+        fprintf(stderr, "display power on message self-test failed\n");
+        return 1;
+    }
+
+    char arg0[] = "scrcpy-rfb";
+    char arg1[] = "--turn-screen-off";
+    char arg2[] = "--scrcpy-host";
+    char arg3[] = "127.0.0.2";
+    char arg4[] = "--scrcpy-port";
+    char arg5[] = "12345";
+    char arg6[] = "-rfbport";
+    char arg7[] = "5901";
+    char *test_argv[] = {
+        arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, NULL,
+    };
+    int test_argc = (int) (sizeof(test_argv) / sizeof(test_argv[0])) - 1;
+    struct bridge_options test_options;
+    if (parse_bridge_options(&test_argc, test_argv, &test_options) < 0
+            || !test_options.turn_screen_off
+            || strcmp(test_options.scrcpy_host, "127.0.0.2") != 0
+            || test_options.scrcpy_port != 12345
+            || test_argc != 3
+            || strcmp(test_argv[1], "-rfbport") != 0
+            || strcmp(test_argv[2], "5901") != 0
+            || test_argv[3] != NULL) {
+        fprintf(stderr, "bridge option parsing self-test failed\n");
+        return 1;
+    }
+
     fprintf(stderr, "scrcpy-rfb self-test passed\n");
     return 0;
 }
@@ -1381,6 +1498,7 @@ static void usage(const char *program) {
             "\n"
             "  --scrcpy-host addr   scrcpy server IPv4 address (default %s)\n"
             "  --scrcpy-port port   scrcpy server TCP port (default %d)\n"
+            "  --turn-screen-off    turn the physical display off while running\n"
             "  --self-test          run built-in self tests and exit\n"
             "  --help               show this help\n"
             "\n"
@@ -1390,37 +1508,16 @@ static void usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
-    const char *scrcpy_host = SCRCPY_DEFAULT_HOST;
-    uint16_t scrcpy_port = SCRCPY_DEFAULT_PORT;
-
-    for (int i = 1; i < argc;) {
-        if (strcmp(argv[i], "--self-test") == 0) {
-            return run_self_test();
-        }
-        if (strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
-        }
-        if (strcmp(argv[i], "--scrcpy-host") == 0 && i + 1 < argc) {
-            scrcpy_host = argv[i + 1];
-            memmove(argv + i, argv + i + 2,
-                    (size_t) (argc - i - 2) * sizeof(*argv));
-            argc -= 2;
-            continue;
-        }
-        if (strcmp(argv[i], "--scrcpy-port") == 0 && i + 1 < argc) {
-            long port = strtol(argv[i + 1], NULL, 10);
-            if (port <= 0 || port > 65535) {
-                fprintf(stderr, "invalid scrcpy port: %s\n", argv[i + 1]);
-                return 1;
-            }
-            scrcpy_port = (uint16_t) port;
-            memmove(argv + i, argv + i + 2,
-                    (size_t) (argc - i - 2) * sizeof(*argv));
-            argc -= 2;
-            continue;
-        }
-        ++i;
+    struct bridge_options options;
+    if (parse_bridge_options(&argc, argv, &options) < 0) {
+        return 1;
+    }
+    if (options.self_test) {
+        return run_self_test();
+    }
+    if (options.help) {
+        usage(argv[0]);
+        return 0;
     }
 
     signal(SIGINT, handle_signal);
@@ -1433,12 +1530,12 @@ int main(int argc, char **argv) {
     pthread_cond_init(&screen_buffer_cond, &monotonic_attr);
     pthread_condattr_destroy(&monotonic_attr);
 
-    video_fd = connect_tcp(scrcpy_host, scrcpy_port);
+    video_fd = connect_tcp(options.scrcpy_host, options.scrcpy_port);
     if (video_fd < 0) {
         fprintf(stderr, "failed to connect scrcpy video socket\n");
         return 1;
     }
-    control_fd = connect_tcp(scrcpy_host, scrcpy_port);
+    control_fd = connect_tcp(options.scrcpy_host, options.scrcpy_port);
     if (control_fd < 0) {
         fprintf(stderr, "failed to connect scrcpy control socket\n");
         return 1;
@@ -1510,6 +1607,17 @@ int main(int argc, char **argv) {
      * would otherwise derive a zero-timeout busy poll on unpatched trees. */
     rfbRunEventLoop(rfb_screen, 100 * 1000, TRUE);
     rfb_ready = 1;
+
+    int restore_display_power = 0;
+    if (options.turn_screen_off && running) {
+        if (send_display_power(0) < 0) {
+            fprintf(stderr, "failed to turn the Android display off\n");
+        } else {
+            restore_display_power = 1;
+            fprintf(stderr,
+                    "Android display power-off requested while mirroring\n");
+        }
+    }
 
     fprintf(stderr,
             "RFB listening on port %d (H.264 passthrough + Tight/JPEG fallback)\n",
@@ -1637,6 +1745,13 @@ int main(int argc, char **argv) {
         nanosleep(&delay, NULL);
     }
 
+    if (restore_display_power) {
+        if (send_display_power(1) < 0) {
+            fprintf(stderr, "failed to restore the Android display power\n");
+        } else {
+            fprintf(stderr, "Android display power-on restore requested\n");
+        }
+    }
     running = 0;
     rfbShutdownServer(rfb_screen, TRUE);
     shutdown(video_fd, SHUT_RDWR);
