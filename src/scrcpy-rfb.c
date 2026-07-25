@@ -415,12 +415,11 @@ static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
     }
 }
 
-/* Non-blocking: copy the next access unit this client should send. A client
- * that falls behind catches up only from a recent keyframe; otherwise it
- * abandons the stale GOP and waits at the live edge. Returns 0 when it must
- * wait for a later enqueue; *needs_keyframe means the stream cannot resume
- * without a fresh keyframe, *more_pending that another eligible frame is
- * already queued behind the returned one. */
+/* Non-blocking: copy the next access unit this client should send, skipping
+ * ahead when it has fallen behind and a keyframe close enough to the live edge
+ * is queued. Returns 0 when it must wait for a later enqueue; *needs_keyframe
+ * means the stream cannot resume without a fresh keyframe, *more_pending that
+ * another eligible frame is already queued behind the returned one. */
 static int copy_next_frame(struct client_state *state, struct frame *frame,
                            int *needs_keyframe, int *more_pending) {
     struct frame *source = NULL;
