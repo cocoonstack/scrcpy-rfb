@@ -50,8 +50,15 @@ Start a scrcpy 4.x server with H.264 video and a TCP listener, then:
 
 ```sh
 scrcpy-rfb [--scrcpy-host 127.0.0.1] [--scrcpy-port 27183] \
+           [--turn-screen-off] \
            [libvncserver options]
 ```
+
+`--turn-screen-off` asks the scrcpy server to power off the physical display
+after the video, control, and RFB paths are ready. Mirroring continues through
+the virtual display. On every normal exit and handled `SIGINT`/`SIGTERM`, the
+bridge sends a best-effort display-on message before closing the control
+socket. A forced kill or a broken control connection cannot guarantee restore.
 
 All standard libvncserver options are accepted, notably:
 
