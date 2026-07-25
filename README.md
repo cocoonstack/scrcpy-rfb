@@ -104,8 +104,8 @@ disable-display-resize: true
   keyframe remains usable when the screen is static.
 - H.264 passthrough is push-based: a new access unit wakes only the H.264
   clients (no per-frame RFB request/response round trip), and each client keeps
-  its own frame cursor. A client with no decoder state — one that just
-  connected, or one whose cursor fell out of the queue — joins from a keyframe
+  its own frame cursor. A client with no decoder state (one that just
+  connected, or one whose cursor fell out of the queue) joins from a keyframe
   within six access units of the live edge, or else waits at the live edge for
   a fresh one instead of replaying an old GOP; if that reset is rate-limited or
   cannot be sent it replays the cached GOP, so a static screen cannot leave it
