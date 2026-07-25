@@ -1217,6 +1217,10 @@ static int h264_live_edge_self_test(void) {
         failure = "failed to extend the GOP past the catch-up limit";
         goto failed;
     }
+    if (enqueue_test_frame(0x22, 0) < 0) {
+        failure = "failed to extend the cached GOP replay";
+        goto failed;
+    }
 
     pthread_mutex_lock(&frame_mutex);
     stale_live_edge = frame_next_sequence;
@@ -1237,9 +1241,20 @@ static int h264_live_edge_self_test(void) {
             || !frame.key_frame || frame.sequence != 1
             || new_stale.next_sequence != 2
             || new_stale.waiting_for_key_frame
+            || !new_stale.replaying_stale_gop
+            || needs_keyframe || !more_pending) {
+        failure = "cached GOP replay did not start from its keyframe";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    if (!copy_next_frame(&new_stale, &frame, &needs_keyframe, &more_pending)
+            || frame.key_frame || frame.sequence != 2
+            || new_stale.next_sequence != 3
+            || new_stale.waiting_for_key_frame
             || new_stale.replaying_stale_gop
             || needs_keyframe || !more_pending) {
-        failure = "rate-limited reset did not fall back to the cached GOP";
+        failure = "cached GOP replay did not drain across the threshold";
         goto failed;
     }
     free_frame(&frame);
