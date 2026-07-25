@@ -99,13 +99,19 @@ disable-display-resize: true
 
 - When the first ordinary VNC client connects, the bridge asks scrcpy to
   reset the video encoder so a static Android screen still produces an
-  immediate config packet and keyframe. An H.264 client that joins while the
-  packet queue holds no keyframe triggers the same rate-limited reset, so it
-  never waits for on-screen motion to start its stream.
+  immediate config packet and keyframe. An H.264 client that has no recent
+  keyframe to join from triggers the same rate-limited reset; a recent queued
+  keyframe remains usable when the screen is static.
 - H.264 passthrough is push-based: a new access unit wakes only the H.264
-  clients (no per-frame RFB request/response round trip), each client keeps
-  its own frame cursor, and a slow client skips to a later keyframe without
-  blocking others.
+  clients (no per-frame RFB request/response round trip), and each client keeps
+  its own frame cursor. A client with no decoder state (one that just
+  connected, or one whose cursor fell out of the queue) joins from a keyframe
+  within six access units of the live edge, or else waits at the live edge for
+  a fresh one instead of replaying an old GOP; if that reset is rate-limited or
+  cannot be sent it replays the cached GOP, so a static screen cannot leave it
+  waiting indefinitely. A client that is already mid-stream only ever skips
+  forward to a keyframe it has not reached yet, so no cursor moves backwards
+  and none is left waiting for a keyframe its decoder does not need.
 - The fallback decode (FFmpeg + swscale) runs on its own thread with a
   bounded queue; if decoding cannot keep up, the backlog is dropped and the
   decoder resynchronizes from a fresh keyframe instead of stalling the

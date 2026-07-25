@@ -48,6 +48,7 @@
 #define SCRCPY_MSG_RESET_VIDEO 17
 
 #define FRAME_QUEUE_CAPACITY 90
+#define H264_MAX_CATCH_UP_FRAMES 6
 #define DECODE_QUEUE_CAPACITY 32
 #define MAX_PACKET_SIZE (8U * 1024U * 1024U)
 #define FALLBACK_TILE_SIZE 32
@@ -310,6 +311,46 @@ static uint64_t latest_key_sequence_locked(void) {
     return sequence;
 }
 
+static uint64_t pending_frames_locked(uint64_t next_sequence) {
+    return next_sequence < frame_next_sequence
+         ? frame_next_sequence - next_sequence
+         : 0;
+}
+
+/* A client with no decoder state yet (waiting_for_key_frame) joins a queued
+ * IDR only when it is near the live edge; a distant one is abandoned for a
+ * fresh IDR, so a new client cannot burst a whole stale GOP before reaching
+ * live video. It is parked meanwhile. A client that is already mid-stream is
+ * never parked - that would strand it until the screen next changes - and any
+ * keyframe ahead of its cursor is a shortcut, so distance does not matter. */
+static void resync_h264_client_locked(struct client_state *state) {
+    uint64_t latest_key = latest_key_sequence_locked();
+    if (latest_key > state->next_sequence
+            && (!state->waiting_for_key_frame
+                || pending_frames_locked(latest_key)
+                        <= H264_MAX_CATCH_UP_FRAMES)) {
+        state->next_sequence = latest_key;
+        state->waiting_for_key_frame = 0;
+        return;
+    }
+    if (state->waiting_for_key_frame) {
+        state->next_sequence = frame_next_sequence;
+    }
+}
+
+/* If another client just requested an IDR, the global rate limit may suppress
+ * this client's request. Replaying the cached GOP is a correctness fallback
+ * for a static screen, where no later frame would wake the client again. */
+static int replay_latest_gop_locked(struct client_state *state) {
+    uint64_t latest_key = latest_key_sequence_locked();
+    if (!latest_key) {
+        return 0;
+    }
+    state->next_sequence = latest_key;
+    state->waiting_for_key_frame = 0;
+    return 1;
+}
+
 static int send_control(const void *message, size_t size) {
     pthread_mutex_lock(&control_mutex);
     int result = send_all(control_fd, message, size);
@@ -329,8 +370,9 @@ static int send_display_power(int on) {
 }
 
 /* Ask scrcpy for a fresh config packet and keyframe. Unless forced, at most
- * one request per second goes out no matter how many clients are waiting. */
-static void request_video_reset(int force) {
+ * one request per second goes out no matter how many clients are waiting.
+ * Returns 1 when sent, 0 when rate-limited, and -1 on a send failure. */
+static int request_video_reset(int force) {
     const uint8_t message = SCRCPY_MSG_RESET_VIDEO;
     uint64_t now = monotonic_ns();
     int send_reset = 0;
@@ -343,9 +385,14 @@ static void request_video_reset(int force) {
     }
     pthread_mutex_unlock(&reset_mutex);
 
-    if (send_reset && send_control(&message, sizeof(message)) < 0) {
-        fprintf(stderr, "failed to request a video reset\n");
+    if (!send_reset) {
+        return 0;
     }
+    if (send_control(&message, sizeof(message)) < 0) {
+        fprintf(stderr, "failed to request a video reset\n");
+        return -1;
+    }
+    return 1;
 }
 
 static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
@@ -370,11 +417,11 @@ static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
     }
 }
 
-/* Non-blocking: copy the next access unit this client should send, skipping
- * to the newest keyframe when it has fallen behind. Returns 0 when it must
- * wait for a later enqueue; *needs_keyframe means the stream cannot resume
- * without a fresh keyframe, *more_pending that another eligible frame is
- * already queued behind the returned one. */
+/* Non-blocking: copy the next access unit this client should send, resyncing
+ * it when it has fallen behind (see resync_h264_client_locked). Returns 0 when
+ * it must wait for a later enqueue; *needs_keyframe means the stream cannot
+ * resume without a fresh keyframe, *more_pending that another eligible frame
+ * is already queued behind the returned one. */
 static int copy_next_frame(struct client_state *state, struct frame *frame,
                            int *needs_keyframe, int *more_pending) {
     struct frame *source = NULL;
@@ -390,12 +437,9 @@ static int copy_next_frame(struct client_state *state, struct frame *frame,
             state->waiting_for_key_frame = 1;
         }
 
-        if (frame_next_sequence - state->next_sequence > 6) {
-            uint64_t latest_key = latest_key_sequence_locked();
-            if (latest_key > state->next_sequence) {
-                state->next_sequence = latest_key;
-                state->waiting_for_key_frame = 0;
-            }
+        if (pending_frames_locked(state->next_sequence)
+                > H264_MAX_CATCH_UP_FRAMES) {
+            resync_h264_client_locked(state);
         }
 
         for (size_t i = 0; i < frame_queue_count; ++i) {
@@ -697,7 +741,15 @@ static rfbBool h264_frame_hook(rfbClientPtr client, char **buffer,
     }
     if (!copy_next_frame(state, &frame, &needs_keyframe, &more_pending)) {
         if (needs_keyframe) {
-            request_video_reset(0);
+            int reset_sent = request_video_reset(0);
+            if (reset_sent <= 0) {
+                pthread_mutex_lock(&frame_mutex);
+                int replay_stale = replay_latest_gop_locked(state);
+                pthread_mutex_unlock(&frame_mutex);
+                if (replay_stale) {
+                    rfbNotifyH264FrameAvailable(rfb_screen);
+                }
+            }
         }
         return FALSE;
     }
@@ -735,9 +787,8 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
 #endif
 
     pthread_mutex_lock(&frame_mutex);
-    uint64_t latest_key = latest_key_sequence_locked();
-    state->next_sequence = latest_key ? latest_key : frame_next_sequence;
-    state->waiting_for_key_frame = latest_key == 0;
+    state->waiting_for_key_frame = 1;
+    resync_h264_client_locked(state);
     pthread_mutex_unlock(&frame_mutex);
 
     client->clientData = state;
@@ -1101,10 +1152,183 @@ static int detect_vertical_scroll(const uint8_t *old_frame,
     return best_dy;
 }
 
+static void reset_frame_queue_for_test(void) {
+    pthread_mutex_lock(&frame_mutex);
+    clear_frame_queue_locked();
+    frame_queue_head = 0;
+    frame_next_sequence = 1;
+    pthread_mutex_unlock(&frame_mutex);
+}
+
+static int enqueue_test_frame(uint8_t marker, int key_frame) {
+    uint8_t *data = malloc(1);
+    if (!data) {
+        return -1;
+    }
+    data[0] = marker;
+    enqueue_frame(data, 1, key_frame);
+    return 0;
+}
+
+static int h264_live_edge_self_test(void) {
+    struct client_state recent = {.waiting_for_key_frame = 1};
+    struct client_state new_stale = {.waiting_for_key_frame = 1};
+    struct client_state mid_skip = {.next_sequence = 1};
+    struct client_state desynced = {.next_sequence = 1,
+                                    .waiting_for_key_frame = 1};
+    struct frame frame = {0};
+    const char *failure = NULL;
+    int needs_keyframe = 0;
+    int more_pending = 0;
+    uint64_t stale_live_edge;
+    uint64_t fresh_key;
+
+    reset_frame_queue_for_test();
+    if (enqueue_test_frame(0x11, 1) < 0) {
+        failure = "failed to allocate recent keyframe";
+        goto failed;
+    }
+    for (int i = 1; i < H264_MAX_CATCH_UP_FRAMES; ++i) {
+        if (enqueue_test_frame((uint8_t) (0x11 + i), 0) < 0) {
+            failure = "failed to allocate recent delta frame";
+            goto failed;
+        }
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+    resync_h264_client_locked(&recent);
+    pthread_mutex_unlock(&frame_mutex);
+    if (recent.next_sequence != 1 || recent.waiting_for_key_frame
+            || !copy_next_frame(&recent, &frame, &needs_keyframe,
+                                &more_pending)
+            || !frame.key_frame || frame.sequence != 1
+            || frame.size != 1 || frame.data[0] != 0x11
+            || recent.next_sequence != 2 || recent.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "recent keyframe was not used for bounded catch-up";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    if (enqueue_test_frame(0x21, 0) < 0) {
+        failure = "failed to extend the GOP past the catch-up limit";
+        goto failed;
+    }
+    if (enqueue_test_frame(0x22, 0) < 0) {
+        failure = "failed to extend the cached GOP replay";
+        goto failed;
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+    stale_live_edge = frame_next_sequence;
+    resync_h264_client_locked(&new_stale);
+    pthread_mutex_unlock(&frame_mutex);
+    if (new_stale.next_sequence != stale_live_edge
+            || !new_stale.waiting_for_key_frame) {
+        failure = "new client did not abandon a stale GOP";
+        goto failed;
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+    int replay_stale = replay_latest_gop_locked(&new_stale);
+    pthread_mutex_unlock(&frame_mutex);
+    if (!replay_stale
+            || !copy_next_frame(&new_stale, &frame, &needs_keyframe,
+                                &more_pending)
+            || !frame.key_frame || frame.sequence != 1
+            || new_stale.next_sequence != 2
+            || new_stale.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "cached GOP replay did not start from its keyframe";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    if (!copy_next_frame(&new_stale, &frame, &needs_keyframe, &more_pending)
+            || frame.key_frame || frame.sequence != 2
+            || new_stale.next_sequence != 3
+            || new_stale.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "cached GOP replay did not drain past the threshold";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    if (copy_next_frame(&desynced, &frame, &needs_keyframe, &more_pending)
+            || desynced.next_sequence != stale_live_edge
+            || !desynced.waiting_for_key_frame
+            || !needs_keyframe || more_pending) {
+        failure = "desynced client did not move to the live edge";
+        goto failed;
+    }
+
+    if (enqueue_test_frame(0x30, 0) < 0
+            || copy_next_frame(&desynced, &frame, &needs_keyframe,
+                               &more_pending)
+            || desynced.next_sequence != stale_live_edge
+            || !desynced.waiting_for_key_frame || !needs_keyframe) {
+        failure = "parked client took a delta it cannot decode";
+        goto failed;
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+    fresh_key = frame_next_sequence;
+    pthread_mutex_unlock(&frame_mutex);
+    if (enqueue_test_frame(0x31, 1) < 0
+            || !copy_next_frame(&desynced, &frame, &needs_keyframe,
+                                &more_pending)
+            || !frame.key_frame || frame.sequence != fresh_key
+            || frame.size != 1 || frame.data[0] != 0x31
+            || desynced.next_sequence != fresh_key + 1
+            || desynced.waiting_for_key_frame
+            || needs_keyframe || more_pending) {
+        failure = "client did not resume from a fresh keyframe";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    if (copy_next_frame(&desynced, &frame, &needs_keyframe, &more_pending)
+            || needs_keyframe || more_pending) {
+        failure = "drained client asked for a keyframe it does not need";
+        goto failed;
+    }
+
+    /* Push that keyframe past the catch-up limit: a mid-stream client must
+     * still skip to it, because any keyframe ahead is less to send than its
+     * backlog. Only a client waiting for one cares how recent it is. */
+    for (int i = 0; i <= H264_MAX_CATCH_UP_FRAMES; ++i) {
+        if (enqueue_test_frame(0x41, 0) < 0) {
+            failure = "failed to push the fresh keyframe past the limit";
+            goto failed;
+        }
+    }
+    if (!copy_next_frame(&mid_skip, &frame, &needs_keyframe, &more_pending)
+            || !frame.key_frame || frame.sequence != fresh_key
+            || mid_skip.next_sequence != fresh_key + 1
+            || mid_skip.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "mid-stream client did not skip to the keyframe ahead";
+        goto failed;
+    }
+
+    free_frame(&frame);
+    reset_frame_queue_for_test();
+    return 0;
+
+failed:
+    fprintf(stderr, "H.264 live-edge self-test failed: %s\n", failure);
+    free_frame(&frame);
+    reset_frame_queue_for_test();
+    return 1;
+}
+
 static int run_self_test(void) {
     const int width = 320;
     const int height = 480;
     const int expected_dy = -24;
+    if (h264_live_edge_self_test()) {
+        return 1;
+    }
     size_t size = (size_t) width * (size_t) height * 4;
     uint8_t *old_frame = malloc(size);
     uint8_t *new_frame = malloc(size);
