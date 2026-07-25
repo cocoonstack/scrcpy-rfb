@@ -103,15 +103,15 @@ disable-display-resize: true
   keyframe to join from triggers the same rate-limited reset; a recent queued
   keyframe remains usable when the screen is static.
 - H.264 passthrough is push-based: a new access unit wakes only the H.264
-  clients (no per-frame RFB request/response round trip), each client keeps
-  its own frame cursor, and normal catch-up is limited to six queued access
-  units. A client further behind abandons the stale GOP and resumes from a
-  fresh keyframe without blocking others. If that reset is rate-limited or
-  cannot be sent, a client that has not already streamed past the cached
-  keyframe replays that GOP instead, so a static screen cannot leave a newly
-  connected client waiting indefinitely. Cursors only ever move forward: a
-  client already past that keyframe waits for the fresh one rather than
-  re-sending its own tail.
+  clients (no per-frame RFB request/response round trip), and each client keeps
+  its own frame cursor. A client with no decoder state — one that just
+  connected, or one whose cursor fell out of the queue — joins from a keyframe
+  within six access units of the live edge, or else waits at the live edge for
+  a fresh one instead of replaying an old GOP; if that reset is rate-limited or
+  cannot be sent it replays the cached GOP, so a static screen cannot leave it
+  waiting indefinitely. A client that is already mid-stream only ever skips
+  forward to a keyframe it has not reached yet, so no cursor moves backwards
+  and none is left waiting for a keyframe its decoder does not need.
 - The fallback decode (FFmpeg + swscale) runs on its own thread with a
   bounded queue; if decoding cannot keep up, the backlog is dropped and the
   decoder resynchronizes from a fresh keyframe instead of stalling the

@@ -72,13 +72,11 @@ struct frame {
 
 struct client_state {
     uint64_t next_sequence;
-    uint64_t abandoned_sequence;
     uint64_t ordinary_update_us_ema;
     struct timespec ordinary_update_started;
     int ordinary_requested_jpeg_quality;
     int ordinary_applied_jpeg_quality;
     int waiting_for_key_frame;
-    int replaying_stale_gop;
     int framebuffer_lock_held;
     int previous_left_button;
     int previous_wheel_buttons;
@@ -320,37 +318,34 @@ static uint64_t pending_frames_locked(uint64_t next_sequence) {
 }
 
 /* A short catch-up from a recent IDR avoids an unnecessary encoder reset,
- * especially for a static screen. Older GOPs are abandoned so a new or slow
- * client cannot burst the whole frame queue before reaching live video. */
+ * especially for a static screen. Only a client with no decoder state yet
+ * (waiting_for_key_frame) may be parked at the live edge to wait for a fresh
+ * IDR; one that is already mid-stream keeps its cursor and drains, because
+ * parking it would strand it until the screen next changes. */
 static void resync_h264_client_locked(struct client_state *state) {
     uint64_t latest_key = latest_key_sequence_locked();
-    state->replaying_stale_gop = 0;
-    if (latest_key
+    if (latest_key > state->next_sequence
             && pending_frames_locked(latest_key)
                     <= H264_MAX_CATCH_UP_FRAMES) {
         state->next_sequence = latest_key;
         state->waiting_for_key_frame = 0;
         return;
     }
-
-    state->abandoned_sequence = state->next_sequence;
-    state->next_sequence = frame_next_sequence;
-    state->waiting_for_key_frame = 1;
+    if (state->waiting_for_key_frame) {
+        state->next_sequence = frame_next_sequence;
+    }
 }
 
 /* If another client just requested an IDR, the global rate limit may suppress
  * this client's request. Replaying the cached GOP is a correctness fallback
- * for a static screen, where no later frame would wake the client again. It
- * must stay forward-only: a client that already streamed past this keyframe
- * would otherwise re-send its own tail over the link that just fell behind. */
+ * for a static screen, where no later frame would wake the client again. */
 static int replay_latest_gop_locked(struct client_state *state) {
     uint64_t latest_key = latest_key_sequence_locked();
-    if (!latest_key || latest_key < state->abandoned_sequence) {
+    if (!latest_key) {
         return 0;
     }
     state->next_sequence = latest_key;
     state->waiting_for_key_frame = 0;
-    state->replaying_stale_gop = 1;
     return 1;
 }
 
@@ -439,11 +434,9 @@ static int copy_next_frame(struct client_state *state, struct frame *frame,
         if (state->next_sequence < oldest_sequence) {
             state->next_sequence = oldest_sequence;
             state->waiting_for_key_frame = 1;
-            state->replaying_stale_gop = 0;
         }
 
-        if (!state->replaying_stale_gop
-                && pending_frames_locked(state->next_sequence)
+        if (pending_frames_locked(state->next_sequence)
                 > H264_MAX_CATCH_UP_FRAMES) {
             resync_h264_client_locked(state);
         }
@@ -479,11 +472,6 @@ static int copy_next_frame(struct client_state *state, struct frame *frame,
     frame->sequence = source->sequence;
     state->next_sequence = source->sequence + 1;
     state->waiting_for_key_frame = 0;
-    if (state->replaying_stale_gop
-            && pending_frames_locked(state->next_sequence)
-                    <= H264_MAX_CATCH_UP_FRAMES) {
-        state->replaying_stale_gop = 0;
-    }
     *more_pending = frame_next_sequence > state->next_sequence;
     pthread_mutex_unlock(&frame_mutex);
     return 1;
@@ -798,6 +786,7 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
 #endif
 
     pthread_mutex_lock(&frame_mutex);
+    state->waiting_for_key_frame = 1;
     resync_h264_client_locked(state);
     pthread_mutex_unlock(&frame_mutex);
 
@@ -1181,10 +1170,11 @@ static int enqueue_test_frame(uint8_t marker, int key_frame) {
 }
 
 static int h264_live_edge_self_test(void) {
-    struct client_state recent = {0};
-    struct client_state new_stale = {0};
+    struct client_state recent = {.waiting_for_key_frame = 1};
+    struct client_state new_stale = {.waiting_for_key_frame = 1};
     struct client_state streaming = {.next_sequence = 2};
-    struct client_state slow = {.next_sequence = 1};
+    struct client_state desynced = {.next_sequence = 1,
+                                    .waiting_for_key_frame = 1};
     struct frame frame = {0};
     const char *failure = NULL;
     int needs_keyframe = 0;
@@ -1246,7 +1236,6 @@ static int h264_live_edge_self_test(void) {
             || !frame.key_frame || frame.sequence != 1
             || new_stale.next_sequence != 2
             || new_stale.waiting_for_key_frame
-            || !new_stale.replaying_stale_gop
             || needs_keyframe || !more_pending) {
         failure = "cached GOP replay did not start from its keyframe";
         goto failed;
@@ -1257,43 +1246,38 @@ static int h264_live_edge_self_test(void) {
             || frame.key_frame || frame.sequence != 2
             || new_stale.next_sequence != 3
             || new_stale.waiting_for_key_frame
-            || new_stale.replaying_stale_gop
             || needs_keyframe || !more_pending) {
-        failure = "cached GOP replay did not drain across the threshold";
+        failure = "cached GOP replay did not drain past the threshold";
         goto failed;
     }
     free_frame(&frame);
 
-    if (copy_next_frame(&streaming, &frame, &needs_keyframe, &more_pending)
-            || streaming.next_sequence != stale_live_edge
-            || !needs_keyframe) {
-        failure = "streaming client did not park at the live edge";
+    if (!copy_next_frame(&streaming, &frame, &needs_keyframe, &more_pending)
+            || frame.key_frame || frame.sequence != 2
+            || streaming.next_sequence != 3
+            || streaming.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "mid-stream client was parked instead of draining";
         goto failed;
     }
-    pthread_mutex_lock(&frame_mutex);
-    int replay_streaming = replay_latest_gop_locked(&streaming);
-    pthread_mutex_unlock(&frame_mutex);
-    if (replay_streaming || streaming.next_sequence != stale_live_edge
-            || streaming.replaying_stale_gop) {
-        failure = "cached GOP replay rewound a client past what it sent";
-        goto failed;
-    }
+    free_frame(&frame);
 
-    if (copy_next_frame(&slow, &frame, &needs_keyframe, &more_pending)
-            || slow.next_sequence != stale_live_edge
-            || !slow.waiting_for_key_frame
+    if (copy_next_frame(&desynced, &frame, &needs_keyframe, &more_pending)
+            || desynced.next_sequence != stale_live_edge
+            || !desynced.waiting_for_key_frame
             || !needs_keyframe || more_pending) {
-        failure = "slow client did not move to the live edge";
+        failure = "desynced client did not move to the live edge";
         goto failed;
     }
 
     if (enqueue_test_frame(0x31, 1) < 0
-            || !copy_next_frame(&slow, &frame, &needs_keyframe,
+            || !copy_next_frame(&desynced, &frame, &needs_keyframe,
                                 &more_pending)
             || !frame.key_frame || frame.sequence != stale_live_edge
             || frame.size != 1 || frame.data[0] != 0x31
-            || slow.next_sequence != stale_live_edge + 1
-            || slow.waiting_for_key_frame || needs_keyframe || more_pending) {
+            || desynced.next_sequence != stale_live_edge + 1
+            || desynced.waiting_for_key_frame
+            || needs_keyframe || more_pending) {
         failure = "client did not resume from a fresh keyframe";
         goto failed;
     }
