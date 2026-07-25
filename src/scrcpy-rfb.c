@@ -317,16 +317,18 @@ static uint64_t pending_frames_locked(uint64_t next_sequence) {
          : 0;
 }
 
-/* A short catch-up from a recent IDR avoids an unnecessary encoder reset,
- * especially for a static screen. Only a client with no decoder state yet
- * (waiting_for_key_frame) may be parked at the live edge to wait for a fresh
- * IDR; one that is already mid-stream keeps its cursor and drains, because
- * parking it would strand it until the screen next changes. */
+/* A client with no decoder state yet (waiting_for_key_frame) joins a queued
+ * IDR only when it is near the live edge; a distant one is abandoned for a
+ * fresh IDR, so a new client cannot burst a whole stale GOP before reaching
+ * live video. It is parked meanwhile. A client that is already mid-stream is
+ * never parked - that would strand it until the screen next changes - and any
+ * keyframe ahead of its cursor is a shortcut, so distance does not matter. */
 static void resync_h264_client_locked(struct client_state *state) {
     uint64_t latest_key = latest_key_sequence_locked();
     if (latest_key > state->next_sequence
-            && pending_frames_locked(latest_key)
-                    <= H264_MAX_CATCH_UP_FRAMES) {
+            && (!state->waiting_for_key_frame
+                || pending_frames_locked(latest_key)
+                        <= H264_MAX_CATCH_UP_FRAMES)) {
         state->next_sequence = latest_key;
         state->waiting_for_key_frame = 0;
         return;
@@ -1172,6 +1174,7 @@ static int h264_live_edge_self_test(void) {
     struct client_state recent = {.waiting_for_key_frame = 1};
     struct client_state new_stale = {.waiting_for_key_frame = 1};
     struct client_state streaming = {.next_sequence = 2};
+    struct client_state mid_skip = {.next_sequence = 1};
     struct client_state desynced = {.next_sequence = 1,
                                     .waiting_for_key_frame = 1};
     struct frame frame = {0};
@@ -1278,6 +1281,25 @@ static int h264_live_edge_self_test(void) {
             || desynced.waiting_for_key_frame
             || needs_keyframe || more_pending) {
         failure = "client did not resume from a fresh keyframe";
+        goto failed;
+    }
+    free_frame(&frame);
+
+    /* Push that keyframe past the catch-up limit: a mid-stream client must
+     * still skip to it, because any keyframe ahead is less to send than its
+     * backlog. Only a client waiting for one cares how recent it is. */
+    for (int i = 0; i <= H264_MAX_CATCH_UP_FRAMES; ++i) {
+        if (enqueue_test_frame(0x41, 0) < 0) {
+            failure = "failed to push the fresh keyframe past the limit";
+            goto failed;
+        }
+    }
+    if (!copy_next_frame(&mid_skip, &frame, &needs_keyframe, &more_pending)
+            || !frame.key_frame || frame.sequence != stale_live_edge
+            || mid_skip.next_sequence != stale_live_edge + 1
+            || mid_skip.waiting_for_key_frame
+            || needs_keyframe || !more_pending) {
+        failure = "mid-stream client did not skip to the keyframe ahead";
         goto failed;
     }
 
