@@ -107,8 +107,11 @@ disable-display-resize: true
   its own frame cursor, and normal catch-up is limited to six queued access
   units. A client further behind abandons the stale GOP and resumes from a
   fresh keyframe without blocking others. If that reset is rate-limited or
-  cannot be sent, the exceptional fallback may replay the complete cached
-  GOP so a static screen cannot leave the client waiting indefinitely.
+  cannot be sent, a client that has not already streamed past the cached
+  keyframe replays that GOP instead, so a static screen cannot leave a newly
+  connected client waiting indefinitely. Cursors only ever move forward: a
+  client already past that keyframe waits for the fresh one rather than
+  re-sending its own tail.
 - The fallback decode (FFmpeg + swscale) runs on its own thread with a
   bounded queue; if decoding cannot keep up, the backlog is dropped and the
   decoder resynchronizes from a fresh keyframe instead of stalling the

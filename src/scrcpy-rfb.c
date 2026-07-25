@@ -72,6 +72,7 @@ struct frame {
 
 struct client_state {
     uint64_t next_sequence;
+    uint64_t abandoned_sequence;
     uint64_t ordinary_update_us_ema;
     struct timespec ordinary_update_started;
     int ordinary_requested_jpeg_quality;
@@ -332,16 +333,19 @@ static void resync_h264_client_locked(struct client_state *state) {
         return;
     }
 
+    state->abandoned_sequence = state->next_sequence;
     state->next_sequence = frame_next_sequence;
     state->waiting_for_key_frame = 1;
 }
 
 /* If another client just requested an IDR, the global rate limit may suppress
  * this client's request. Replaying the cached GOP is a correctness fallback
- * for a static screen, where no later frame would wake the client again. */
+ * for a static screen, where no later frame would wake the client again. It
+ * must stay forward-only: a client that already streamed past this keyframe
+ * would otherwise re-send its own tail over the link that just fell behind. */
 static int replay_latest_gop_locked(struct client_state *state) {
     uint64_t latest_key = latest_key_sequence_locked();
-    if (!latest_key) {
+    if (!latest_key || latest_key < state->abandoned_sequence) {
         return 0;
     }
     state->next_sequence = latest_key;
@@ -1179,6 +1183,7 @@ static int enqueue_test_frame(uint8_t marker, int key_frame) {
 static int h264_live_edge_self_test(void) {
     struct client_state recent = {0};
     struct client_state new_stale = {0};
+    struct client_state streaming = {.next_sequence = 2};
     struct client_state slow = {.next_sequence = 1};
     struct frame frame = {0};
     const char *failure = NULL;
@@ -1258,6 +1263,21 @@ static int h264_live_edge_self_test(void) {
         goto failed;
     }
     free_frame(&frame);
+
+    if (copy_next_frame(&streaming, &frame, &needs_keyframe, &more_pending)
+            || streaming.next_sequence != stale_live_edge
+            || !needs_keyframe) {
+        failure = "streaming client did not park at the live edge";
+        goto failed;
+    }
+    pthread_mutex_lock(&frame_mutex);
+    int replay_streaming = replay_latest_gop_locked(&streaming);
+    pthread_mutex_unlock(&frame_mutex);
+    if (replay_streaming || streaming.next_sequence != stale_live_edge
+            || streaming.replaying_stale_gop) {
+        failure = "cached GOP replay rewound a client past what it sent";
+        goto failed;
+    }
 
     if (copy_next_frame(&slow, &frame, &needs_keyframe, &more_pending)
             || slow.next_sequence != stale_live_edge
