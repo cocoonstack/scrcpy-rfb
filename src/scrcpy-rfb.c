@@ -417,11 +417,11 @@ static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
     }
 }
 
-/* Non-blocking: copy the next access unit this client should send, skipping
- * ahead when it has fallen behind and a keyframe close enough to the live edge
- * is queued. Returns 0 when it must wait for a later enqueue; *needs_keyframe
- * means the stream cannot resume without a fresh keyframe, *more_pending that
- * another eligible frame is already queued behind the returned one. */
+/* Non-blocking: copy the next access unit this client should send, resyncing
+ * it when it has fallen behind (see resync_h264_client_locked). Returns 0 when
+ * it must wait for a later enqueue; *needs_keyframe means the stream cannot
+ * resume without a fresh keyframe, *more_pending that another eligible frame
+ * is already queued behind the returned one. */
 static int copy_next_frame(struct client_state *state, struct frame *frame,
                            int *needs_keyframe, int *more_pending) {
     struct frame *source = NULL;
@@ -1173,7 +1173,6 @@ static int enqueue_test_frame(uint8_t marker, int key_frame) {
 static int h264_live_edge_self_test(void) {
     struct client_state recent = {.waiting_for_key_frame = 1};
     struct client_state new_stale = {.waiting_for_key_frame = 1};
-    struct client_state streaming = {.next_sequence = 2};
     struct client_state mid_skip = {.next_sequence = 1};
     struct client_state desynced = {.next_sequence = 1,
                                     .waiting_for_key_frame = 1};
@@ -1182,6 +1181,7 @@ static int h264_live_edge_self_test(void) {
     int needs_keyframe = 0;
     int more_pending = 0;
     uint64_t stale_live_edge;
+    uint64_t fresh_key;
 
     reset_frame_queue_for_test();
     if (enqueue_test_frame(0x11, 1) < 0) {
@@ -1254,16 +1254,6 @@ static int h264_live_edge_self_test(void) {
     }
     free_frame(&frame);
 
-    if (!copy_next_frame(&streaming, &frame, &needs_keyframe, &more_pending)
-            || frame.key_frame || frame.sequence != 2
-            || streaming.next_sequence != 3
-            || streaming.waiting_for_key_frame
-            || needs_keyframe || !more_pending) {
-        failure = "mid-stream client was parked instead of draining";
-        goto failed;
-    }
-    free_frame(&frame);
-
     if (copy_next_frame(&desynced, &frame, &needs_keyframe, &more_pending)
             || desynced.next_sequence != stale_live_edge
             || !desynced.waiting_for_key_frame
@@ -1272,18 +1262,36 @@ static int h264_live_edge_self_test(void) {
         goto failed;
     }
 
+    if (enqueue_test_frame(0x30, 0) < 0
+            || copy_next_frame(&desynced, &frame, &needs_keyframe,
+                               &more_pending)
+            || desynced.next_sequence != stale_live_edge
+            || !desynced.waiting_for_key_frame || !needs_keyframe) {
+        failure = "parked client took a delta it cannot decode";
+        goto failed;
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+    fresh_key = frame_next_sequence;
+    pthread_mutex_unlock(&frame_mutex);
     if (enqueue_test_frame(0x31, 1) < 0
             || !copy_next_frame(&desynced, &frame, &needs_keyframe,
                                 &more_pending)
-            || !frame.key_frame || frame.sequence != stale_live_edge
+            || !frame.key_frame || frame.sequence != fresh_key
             || frame.size != 1 || frame.data[0] != 0x31
-            || desynced.next_sequence != stale_live_edge + 1
+            || desynced.next_sequence != fresh_key + 1
             || desynced.waiting_for_key_frame
             || needs_keyframe || more_pending) {
         failure = "client did not resume from a fresh keyframe";
         goto failed;
     }
     free_frame(&frame);
+
+    if (copy_next_frame(&desynced, &frame, &needs_keyframe, &more_pending)
+            || needs_keyframe || more_pending) {
+        failure = "drained client asked for a keyframe it does not need";
+        goto failed;
+    }
 
     /* Push that keyframe past the catch-up limit: a mid-stream client must
      * still skip to it, because any keyframe ahead is less to send than its
@@ -1295,8 +1303,8 @@ static int h264_live_edge_self_test(void) {
         }
     }
     if (!copy_next_frame(&mid_skip, &frame, &needs_keyframe, &more_pending)
-            || !frame.key_frame || frame.sequence != stale_live_edge
-            || mid_skip.next_sequence != stale_live_edge + 1
+            || !frame.key_frame || frame.sequence != fresh_key
+            || mid_skip.next_sequence != fresh_key + 1
             || mid_skip.waiting_for_key_frame
             || needs_keyframe || !more_pending) {
         failure = "mid-stream client did not skip to the keyframe ahead";
