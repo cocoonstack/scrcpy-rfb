@@ -58,6 +58,7 @@
 #define FALLBACK_TCP_SEND_BUFFER (256 * 1024)
 #define FALLBACK_TCP_NOTSENT_LOWAT (64 * 1024)
 #define RESET_REQUEST_INTERVAL_NS UINT64_C(1000000000)
+#define DECODE_KEYFRAME_WAIT_NS UINT64_C(1500000000)
 #define SCROLL_ROW_SAMPLES 16
 #define SCROLL_SAMPLE_ROW_STEP 8
 #define SCROLL_MIN_SHIFT 4
@@ -116,6 +117,8 @@ static struct frame decode_queue[DECODE_QUEUE_CAPACITY];
 static size_t decode_queue_head;
 static size_t decode_queue_count;
 static int decode_skip_until_key;
+static uint64_t decode_keyframe_wait_started_ns;
+static uint64_t decode_backlog_drop_count;
 static pthread_mutex_t decode_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t decode_cond = PTHREAD_COND_INITIALIZER;
 
@@ -580,31 +583,79 @@ static void clear_decode_queue_locked(void) {
     }
 }
 
+enum decode_resync_action {
+    DECODE_RESYNC_PROCESS,
+    DECODE_RESYNC_DROP,
+    DECODE_RESYNC_REQUEST_KEYFRAME,
+};
+
+/* A full fallback queue means the decoder is no longer at the live edge.
+ * Discard the stale GOP and wait briefly for the next encoder keyframe. The
+ * scrcpy server is reset only if an active stream fails to provide one within
+ * the bounded wait; resetting immediately on every overflow tears down the
+ * capture pipeline and can turn ordinary VNC load into a reset storm.
+ * DECODE_KEYFRAME_WAIT_NS therefore has to exceed the encoder's configured
+ * i-frame-interval, or the wait expires before the keyframe it waits for. */
+static enum decode_resync_action decode_resync_action_locked(int key_frame,
+                                                            uint64_t now_ns) {
+    if (!decode_skip_until_key) {
+        return DECODE_RESYNC_PROCESS;
+    }
+    if (key_frame) {
+        decode_skip_until_key = 0;
+        decode_keyframe_wait_started_ns = 0;
+        return DECODE_RESYNC_PROCESS;
+    }
+    if (now_ns - decode_keyframe_wait_started_ns
+            >= DECODE_KEYFRAME_WAIT_NS) {
+        decode_keyframe_wait_started_ns = now_ns;
+        return DECODE_RESYNC_REQUEST_KEYFRAME;
+    }
+    return DECODE_RESYNC_DROP;
+}
+
 /* Hand a copy of the packet to the decoder thread. When decoding cannot keep
  * up, drop the backlog and resynchronize from the next keyframe instead of
  * stalling the video socket. */
 static void decode_submit(const uint8_t *data, size_t size, int key_frame) {
     uint8_t *copy;
     size_t tail;
+    uint64_t now_ns;
 
     if (!fallback_mode) {
         return;
     }
 
+    now_ns = monotonic_ns();
     pthread_mutex_lock(&decode_mutex);
-    if (decode_skip_until_key && !key_frame) {
+    enum decode_resync_action action =
+            decode_resync_action_locked(key_frame, now_ns);
+    if (action != DECODE_RESYNC_PROCESS) {
         pthread_mutex_unlock(&decode_mutex);
+        if (action == DECODE_RESYNC_REQUEST_KEYFRAME
+                && request_video_reset(0) > 0) {
+            fprintf(stderr,
+                    "fallback decoder waited %.1f ms for a keyframe; "
+                    "requested one\n",
+                    (double) DECODE_KEYFRAME_WAIT_NS / 1000000.0);
+        }
         return;
     }
-    decode_skip_until_key = 0;
 
     if (decode_queue_count == DECODE_QUEUE_CAPACITY) {
         clear_decode_queue_locked();
         fallback_decoder_reset = 1;
         if (!key_frame) {
             decode_skip_until_key = 1;
+            decode_keyframe_wait_started_ns = now_ns;
+            uint64_t drop_count = ++decode_backlog_drop_count;
             pthread_mutex_unlock(&decode_mutex);
-            request_video_reset(0);
+            if (drop_count <= 4 || !(drop_count & (drop_count - 1))) {
+                fprintf(stderr,
+                        "fallback decode backlog dropped at live edge "
+                        "(count=%llu); waiting for next keyframe\n",
+                        (unsigned long long) drop_count);
+            }
             return;
         }
     }
@@ -1322,11 +1373,147 @@ failed:
     return 1;
 }
 
+static int fallback_decode_resync_self_test(void) {
+    int saved_skip_until_key = decode_skip_until_key;
+    uint64_t saved_wait_started_ns = decode_keyframe_wait_started_ns;
+    uint64_t saved_backlog_drop_count = decode_backlog_drop_count;
+    uint64_t saved_last_reset_request_ns = last_reset_request_ns;
+    int saved_fallback_mode = fallback_mode;
+    int saved_fallback_decoder_reset = fallback_decoder_reset;
+    int saved_control_fd = control_fd;
+    int control_pair[2] = {-1, -1};
+    const uint64_t started_ns = UINT64_C(1000000000);
+    const char *failure = NULL;
+    uint8_t packet = 0x42;
+
+    pthread_mutex_lock(&decode_mutex);
+    decode_skip_until_key = 1;
+    decode_keyframe_wait_started_ns = started_ns;
+    enum decode_resync_action before_wait = decode_resync_action_locked(
+            0, started_ns + DECODE_KEYFRAME_WAIT_NS - 1);
+    enum decode_resync_action at_wait = decode_resync_action_locked(
+            0, started_ns + DECODE_KEYFRAME_WAIT_NS);
+    uint64_t wait_restarted_ns = decode_keyframe_wait_started_ns;
+    enum decode_resync_action after_request = decode_resync_action_locked(
+            0, started_ns + 2 * DECODE_KEYFRAME_WAIT_NS - 1);
+    enum decode_resync_action on_key_frame = decode_resync_action_locked(
+            1, started_ns + 2 * DECODE_KEYFRAME_WAIT_NS);
+    int skipping_after_key = decode_skip_until_key;
+    uint64_t waiting_after_key = decode_keyframe_wait_started_ns;
+    pthread_mutex_unlock(&decode_mutex);
+
+    if (before_wait != DECODE_RESYNC_DROP) {
+        failure = "requested a keyframe before the bounded wait elapsed";
+        goto done;
+    }
+    if (at_wait != DECODE_RESYNC_REQUEST_KEYFRAME
+            || wait_restarted_ns != started_ns + DECODE_KEYFRAME_WAIT_NS) {
+        failure = "did not request a keyframe after the bounded wait";
+        goto done;
+    }
+    if (after_request != DECODE_RESYNC_DROP) {
+        failure = "repeated the keyframe request without another wait";
+        goto done;
+    }
+    if (on_key_frame != DECODE_RESYNC_PROCESS
+            || skipping_after_key || waiting_after_key) {
+        failure = "natural keyframe did not resume fallback decoding";
+        goto done;
+    }
+
+    pthread_mutex_lock(&decode_mutex);
+    clear_decode_queue_locked();
+    decode_queue_head = 0;
+    for (size_t i = 0; i < DECODE_QUEUE_CAPACITY; ++i) {
+        decode_queue[i].data = malloc(1);
+        if (!decode_queue[i].data) {
+            pthread_mutex_unlock(&decode_mutex);
+            failure = "failed to allocate the overflow test queue";
+            goto done;
+        }
+        decode_queue[i].data[0] = (uint8_t) i;
+        decode_queue[i].size = 1;
+        ++decode_queue_count;
+    }
+    pthread_mutex_unlock(&decode_mutex);
+
+    fallback_mode = 1;
+    decode_skip_until_key = 0;
+    decode_keyframe_wait_started_ns = 0;
+    last_reset_request_ns = started_ns;
+    uint64_t backlog_drop_count = decode_backlog_drop_count;
+    decode_submit(&packet, sizeof(packet), 0);
+    if (decode_queue_count || !decode_skip_until_key
+            || !decode_keyframe_wait_started_ns
+            || decode_backlog_drop_count != backlog_drop_count + 1
+            || last_reset_request_ns != started_ns) {
+        failure = "queue overflow did not wait for a natural keyframe";
+        goto done;
+    }
+
+    /* decode_submit's resync branch holds the only keyframe request this path
+     * adds, so drive it over a real control socket and read the message back
+     * rather than inferring it from the rate-limiter timestamp. */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control_pair) < 0) {
+        failure = "failed to create the control socket pair";
+        goto done;
+    }
+    control_fd = control_pair[0];
+
+    last_reset_request_ns = 0;
+    pthread_mutex_lock(&decode_mutex);
+    decode_keyframe_wait_started_ns = monotonic_ns();
+    pthread_mutex_unlock(&decode_mutex);
+    decode_submit(&packet, sizeof(packet), 0);
+    if (decode_queue_count || last_reset_request_ns) {
+        failure = "packet was queued or reset the encoder during the wait";
+        goto done;
+    }
+
+    pthread_mutex_lock(&decode_mutex);
+    decode_keyframe_wait_started_ns = monotonic_ns() - DECODE_KEYFRAME_WAIT_NS;
+    pthread_mutex_unlock(&decode_mutex);
+    decode_submit(&packet, sizeof(packet), 0);
+    uint8_t reset_message = 0;
+    if (decode_queue_count || !last_reset_request_ns
+            || recv(control_pair[1], &reset_message, 1, MSG_DONTWAIT) != 1
+            || reset_message != SCRCPY_MSG_RESET_VIDEO) {
+        failure = "no keyframe was requested after the bounded wait elapsed";
+        goto done;
+    }
+
+done:
+    pthread_mutex_lock(&decode_mutex);
+    clear_decode_queue_locked();
+    decode_queue_head = 0;
+    pthread_mutex_unlock(&decode_mutex);
+    decode_skip_until_key = saved_skip_until_key;
+    decode_keyframe_wait_started_ns = saved_wait_started_ns;
+    decode_backlog_drop_count = saved_backlog_drop_count;
+    last_reset_request_ns = saved_last_reset_request_ns;
+    fallback_mode = saved_fallback_mode;
+    fallback_decoder_reset = saved_fallback_decoder_reset;
+    control_fd = saved_control_fd;
+    if (control_pair[0] >= 0) {
+        close(control_pair[0]);
+        close(control_pair[1]);
+    }
+    if (failure) {
+        fprintf(stderr, "fallback decode resync self-test failed: %s\n",
+                failure);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_self_test(void) {
     const int width = 320;
     const int height = 480;
     const int expected_dy = -24;
     if (h264_live_edge_self_test()) {
+        return 1;
+    }
+    if (fallback_decode_resync_self_test()) {
         return 1;
     }
     size_t size = (size_t) width * (size_t) height * 4;
@@ -1886,6 +2073,11 @@ int main(int argc, char **argv) {
                 pthread_mutex_lock(&fallback_mutex);
                 fallback_frame_ready = 0;
                 pthread_mutex_unlock(&fallback_mutex);
+                pthread_mutex_lock(&decode_mutex);
+                decode_skip_until_key = 0;
+                decode_keyframe_wait_started_ns = 0;
+                decode_backlog_drop_count = 0;
+                pthread_mutex_unlock(&decode_mutex);
                 fallback_decoder_reset = 1;
                 last_fallback_publish_ns = 0;
                 ordinary_fps = 60;

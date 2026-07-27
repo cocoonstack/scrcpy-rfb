@@ -114,8 +114,10 @@ disable-display-resize: true
   and none is left waiting for a keyframe its decoder does not need.
 - The fallback decode (FFmpeg + swscale) runs on its own thread with a
   bounded queue; if decoding cannot keep up, the backlog is dropped and the
-  decoder resynchronizes from a fresh keyframe instead of stalling the
-  passthrough socket reads.
+  decoder waits at the live edge for the next encoder keyframe instead of
+  stalling the passthrough socket reads. It requests a keyframe only if an
+  active stream does not provide one within 1.5 seconds; queue pressure alone
+  does not repeatedly tear down and recreate the scrcpy capture pipeline.
 - Ordinary clients get change-detection at 32-pixel tile granularity, RFB
   CopyRect for recognized vertical scrolling, adaptive Tight/JPEG quality
   (Q92/Q86/Q80, never above the client's request) and an adaptive 60/30/20
