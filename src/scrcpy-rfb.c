@@ -1616,8 +1616,7 @@ static int run_self_test(void) {
 
 static void adapt_client_jpeg(rfbClientPtr client,
                               struct client_state *state) {
-    if (client->preferredEncoding != rfbEncodingTight
-            || client->supportsH264Encoding) {
+    if (client->preferredEncoding != rfbEncodingTight) {
         return;
     }
 
@@ -1809,12 +1808,7 @@ static void display_hook(rfbClientPtr client) {
     client->useExtDesktopSize = FALSE;
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
-    if (client->supportsH264Encoding) {
-        client->tightQualityLevel = -1;
-        client->turboQualityLevel = -1;
-    } else {
-        adapt_client_jpeg(client, state);
-    }
+    adapt_client_jpeg(client, state);
 
     pthread_mutex_lock(&screen_ready_mutex);
     while (running && !screen_frame_ready
