@@ -74,7 +74,7 @@ struct frame {
 struct client_state {
     uint64_t next_sequence;
     uint64_t ordinary_update_us_ema;
-    struct timespec ordinary_update_started;
+    uint64_t ordinary_update_started_ns;
     int ordinary_requested_jpeg_quality;
     int ordinary_applied_jpeg_quality;
     int waiting_for_key_frame;
@@ -177,14 +177,6 @@ static uint64_t monotonic_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t) now.tv_sec * UINT64_C(1000000000)
          + (uint64_t) now.tv_nsec;
-}
-
-static uint64_t elapsed_us(const struct timespec *start,
-                           const struct timespec *end) {
-    int64_t seconds = end->tv_sec - start->tv_sec;
-    int64_t nanoseconds = end->tv_nsec - start->tv_nsec;
-    int64_t total = seconds * INT64_C(1000000000) + nanoseconds;
-    return total > 0 ? (uint64_t) total / 1000 : 0;
 }
 
 static int recv_all(int fd, void *buffer, size_t size) {
@@ -800,9 +792,6 @@ static rfbBool h264_frame_hook(rfbClientPtr client, char **buffer,
     int more_pending = 0;
     struct client_state *state = client->clientData;
 
-    if (!state) {
-        return FALSE;
-    }
     log_client_mode_once(client, state);
     if (!copy_next_frame(state, &frame, &needs_keyframe, &more_pending)) {
         if (needs_keyframe) {
@@ -909,9 +898,6 @@ static int send_scroll(int x, int y, int hscroll, int vscroll) {
 
 static void pointer_event(int button_mask, int x, int y, rfbClientPtr client) {
     struct client_state *state = client->clientData;
-    if (!state) {
-        return;
-    }
 
     /* RFB buttons 4-7 (mask bits 3-6) are wheel up/down/left/right; inject
      * on the press edge, independent of pointer-drag ownership. */
@@ -1878,9 +1864,6 @@ static void display_hook(rfbClientPtr client) {
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
 
-    if (!state) {
-        return;
-    }
     log_client_mode_once(client, state);
     if (is_h264_encoding(client->preferredEncoding)) {
         return;
@@ -1908,7 +1891,7 @@ static void display_hook(rfbClientPtr client) {
 
     pthread_rwlock_rdlock(&screen_buffer_lock);
     pthread_mutex_lock(&metrics_mutex);
-    clock_gettime(CLOCK_MONOTONIC, &state->ordinary_update_started);
+    state->ordinary_update_started_ns = monotonic_ns();
     pthread_mutex_unlock(&metrics_mutex);
     state->framebuffer_lock_held = 1;
 }
@@ -1916,12 +1899,11 @@ static void display_hook(rfbClientPtr client) {
 static void display_finished_hook(rfbClientPtr client, int result) {
     (void) result;
     struct client_state *state = client->clientData;
-    if (state && state->framebuffer_lock_held) {
-        struct timespec finished;
-        clock_gettime(CLOCK_MONOTONIC, &finished);
+    if (state->framebuffer_lock_held) {
+        uint64_t finished_ns = monotonic_ns();
         pthread_mutex_lock(&metrics_mutex);
-        uint64_t sample = elapsed_us(&state->ordinary_update_started,
-                                     &finished);
+        uint64_t sample = (finished_ns - state->ordinary_update_started_ns)
+                        / 1000;
         if (!state->ordinary_update_us_ema) {
             state->ordinary_update_us_ema = sample;
         } else {
@@ -1956,13 +1938,11 @@ static void count_client_modes(int *h264_clients, int *standard_clients,
                 ++*copyrect_clients;
             }
             struct client_state *state = client->clientData;
-            if (state) {
-                pthread_mutex_lock(&metrics_mutex);
-                uint64_t update_us = state->ordinary_update_us_ema;
-                pthread_mutex_unlock(&metrics_mutex);
-                if (update_us > *slowest_update_us) {
-                    *slowest_update_us = update_us;
-                }
+            pthread_mutex_lock(&metrics_mutex);
+            uint64_t update_us = state->ordinary_update_us_ema;
+            pthread_mutex_unlock(&metrics_mutex);
+            if (update_us > *slowest_update_us) {
+                *slowest_update_us = update_us;
             }
         }
     }
