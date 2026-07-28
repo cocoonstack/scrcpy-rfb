@@ -343,7 +343,7 @@ index 5cb4265..8548844 100644
      if(i)
          sraRgnReleaseIterator(i);
      sraRgnDestroy(updateRegion);
-@@ -3668,6 +3753,55 @@ updateFailed:
+@@ -3668,6 +3753,61 @@ updateFailed:
  }
  
  
@@ -381,8 +381,14 @@ index 5cb4265..8548844 100644
 +    memcpy(header + sz_rfbFramebufferUpdateRectHeader + 4, &value,
 +           sizeof(value));
 +
++    if (cl->ublen + (int)sizeof(header) > UPDATE_BUF_SIZE) {
++        if (!rfbSendUpdateBuf(cl))
++            return FALSE;
++    }
++    memcpy(cl->updateBuf + cl->ublen, header, sizeof(header));
++    cl->ublen += (int)sizeof(header);
++
 +    if (!rfbSendUpdateBuf(cl) ||
-+        rfbWriteExact(cl, header, (int)sizeof(header)) < 0 ||
 +        rfbWriteExact(cl, frame, (int)frameSize) < 0)
 +        return FALSE;
 +

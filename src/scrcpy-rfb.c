@@ -1093,9 +1093,10 @@ static void describe_scroll_rows(const uint8_t *frame, int width, int height,
     }
 }
 
-/* Scratch for detect_vertical_scroll, grown at most twice per process (the
- * self-test height, then the session height): the detector runs per published
- * frame and must not pay four malloc/free cycles each time. */
+/* Scratch for detect_vertical_scroll, allocated once at the session height:
+ * the detector runs per published frame and must not pay four malloc/free
+ * cycles each time. --self-test returns from main before any session exists,
+ * so the two never coexist. */
 static int reserve_scroll_rows(int height) {
     if (height <= scroll_rows_capacity) {
         return 1;
