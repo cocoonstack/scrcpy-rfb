@@ -2207,7 +2207,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        struct timespec delay = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        /* Without ordinary clients there is no publish to pace; a coarser
+         * tick only delays fallback enable by up to 50 ms. */
+        struct timespec delay = {.tv_sec = 0,
+                                 .tv_nsec = standard_clients > 0
+                                     ? 2 * 1000 * 1000
+                                     : 50 * 1000 * 1000};
         nanosleep(&delay, NULL);
     }
 
