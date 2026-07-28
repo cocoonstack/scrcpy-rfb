@@ -132,6 +132,8 @@ static uint8_t *fallback_buffer;
 static size_t framebuffer_size;
 static int fallback_frame_ready;
 static int fallback_decoder_ready_logged;
+static int mismatch_width;
+static int mismatch_height;
 static pthread_mutex_t fallback_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t screen_buffer_lock = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_mutex_t screen_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -538,11 +540,23 @@ static void decode_fallback_frame(const uint8_t *data, size_t size,
     while (avcodec_receive_frame(decoder_context, decoder_frame) >= 0) {
         if (decoder_frame->width != video_width
                 || decoder_frame->height != video_height) {
-            fprintf(stderr, "fallback decoder size mismatch: %dx%d\n",
-                    decoder_frame->width, decoder_frame->height);
+            /* A rotated phone produces this for every frame from here on, so
+             * log the transition rather than the frame rate. */
+            if (decoder_frame->width != mismatch_width
+                    || decoder_frame->height != mismatch_height) {
+                mismatch_width = decoder_frame->width;
+                mismatch_height = decoder_frame->height;
+                fprintf(stderr,
+                        "fallback decoder size mismatch: %dx%d "
+                        "(session is %dx%d; resize requires restart)\n",
+                        decoder_frame->width, decoder_frame->height,
+                        video_width, video_height);
+            }
             av_frame_unref(decoder_frame);
             continue;
         }
+        mismatch_width = 0;
+        mismatch_height = 0;
 
         sws_context = sws_getCachedContext(
                 sws_context,
@@ -1616,8 +1630,7 @@ static int run_self_test(void) {
 
 static void adapt_client_jpeg(rfbClientPtr client,
                               struct client_state *state) {
-    if (client->preferredEncoding != rfbEncodingTight
-            || client->supportsH264Encoding) {
+    if (client->preferredEncoding != rfbEncodingTight) {
         return;
     }
 
@@ -1799,22 +1812,19 @@ static size_t publish_latest_fallback_frame(struct damage_rect *rects,
  * lock because their frame hook reads the packet queue, not the framebuffer. */
 static void display_hook(rfbClientPtr client) {
     struct client_state *state = client->clientData;
-    if (!state || is_h264_encoding(client->preferredEncoding)) {
-        return;
-    }
 
     /* Do not advertise a resizeable desktop: the scrcpy session size is
      * fixed and several viewers terminate when their automatic
-     * SetDesktopSize request is rejected. */
+     * SetDesktopSize request is rejected. H.264 clients need this as much as
+     * ordinary ones - they advertise ExtDesktopSize too. */
     client->useExtDesktopSize = FALSE;
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
-    if (client->supportsH264Encoding) {
-        client->tightQualityLevel = -1;
-        client->turboQualityLevel = -1;
-    } else {
-        adapt_client_jpeg(client, state);
+
+    if (!state || is_h264_encoding(client->preferredEncoding)) {
+        return;
     }
+    adapt_client_jpeg(client, state);
 
     pthread_mutex_lock(&screen_ready_mutex);
     while (running && !screen_frame_ready
