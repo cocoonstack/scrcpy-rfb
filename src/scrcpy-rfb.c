@@ -881,8 +881,9 @@ static int send_touch(uint8_t action, int x, int y, int pressed) {
     return send_control(message, sizeof(message));
 }
 
-/* hscroll/vscroll are one wheel click each, encoded as scrcpy i16
- * fixed-point where 32767 is 1.0. Positive vscroll scrolls up. */
+/* hscroll/vscroll are one wheel click each. scrcpy's i16 fixed-point spans
+ * [-16, 16] clicks full-scale (the server multiplies the [-1, 1] decode by
+ * 16), so one click is 32768 / 16 = 2048. Positive vscroll scrolls up. */
 static int send_scroll(int x, int y, int hscroll, int vscroll) {
     uint8_t message[21] = {0};
     message[0] = SCRCPY_MSG_INJECT_SCROLL;
@@ -890,8 +891,8 @@ static int send_scroll(int x, int y, int hscroll, int vscroll) {
     AV_WB32(message + 5, (uint32_t) y);
     AV_WB16(message + 9, (uint16_t) video_width);
     AV_WB16(message + 11, (uint16_t) video_height);
-    AV_WB16(message + 13, (uint16_t) (int16_t) (hscroll * 32767));
-    AV_WB16(message + 15, (uint16_t) (int16_t) (vscroll * 32767));
+    AV_WB16(message + 13, (uint16_t) (int16_t) (hscroll * 2048));
+    AV_WB16(message + 15, (uint16_t) (int16_t) (vscroll * 2048));
     AV_WB32(message + 17, 0);
     return send_control(message, sizeof(message));
 }

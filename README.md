@@ -25,7 +25,8 @@ docker run --rm -v "$PWD:/src" scrcpy-rfb-builder
 # -> dist/scrcpy-rfb-linux-<arch>
 ```
 
-Local build (needs cmake, git, libjpeg-turbo, zlib and FFmpeg dev packages):
+Local build (Linux only; needs cmake, git, libjpeg-turbo, zlib and FFmpeg dev
+packages):
 
 ```sh
 make        # cmake configure + build into build/
@@ -46,7 +47,10 @@ docker run --rm --network host ghcr.io/cocoonstack/scrcpy-rfb:master \
 
 ## Running
 
-Start a scrcpy 4.x server with H.264 video and a TCP listener, then:
+Start a scrcpy 4.x server with H.264 video and a TCP listener. The bridge
+expects `video_codec=h264 audio=false send_device_meta=false
+send_dummy_byte=false`: any extra preamble bytes on the video socket break
+its handshake. Then:
 
 ```sh
 scrcpy-rfb [--scrcpy-host 127.0.0.1] [--scrcpy-port 27183] \
