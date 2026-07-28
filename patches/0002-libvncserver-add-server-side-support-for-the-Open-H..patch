@@ -31,15 +31,15 @@ is written directly to the socket. New rfbScreenInfo/rfbClientRec fields
 are appended to the end of the structs to keep the ABI
 backward-compatible.
 ---
- include/rfb/rfb.h            |  33 +++++++
+ include/rfb/rfb.h            |  33 ++++++++++
  include/rfb/rfbproto.h       |   3 +
- src/libvncserver/main.c      |  20 +++++
- src/libvncserver/rfbserver.c | 164 +++++++++++++++++++++++++++++++++--
+ src/libvncserver/main.c      |  20 ++++++
+ src/libvncserver/rfbserver.c | 152 ++++++++++++++++++++++++++++++++++++++++---
  src/libvncserver/stats.c     |   1 +
- 5 files changed, 212 insertions(+), 9 deletions(-)
+ 5 files changed, 200 insertions(+), 9 deletions(-)
 
 diff --git a/include/rfb/rfb.h b/include/rfb/rfb.h
-index e225c034..90b4aec7 100644
+index e225c03..90b4aec 100644
 --- a/include/rfb/rfb.h
 +++ b/include/rfb/rfb.h
 @@ -113,6 +113,24 @@ typedef rfbBool (*rfbPasswordCheckProcPtr)(struct _rfbClientRec* cl,const char*
@@ -111,7 +111,7 @@ index e225c034..90b4aec7 100644
  enum rfbNewClientAction defaultNewClientHook(rfbClientPtr cl);
  void rfbRegisterProtocolExtension(rfbProtocolExtension* extension);
 diff --git a/include/rfb/rfbproto.h b/include/rfb/rfbproto.h
-index ebcd303c..4bd178b7 100644
+index ebcd303..4bd178b 100644
 --- a/include/rfb/rfbproto.h
 +++ b/include/rfb/rfbproto.h
 @@ -460,6 +460,9 @@ typedef struct {
@@ -125,7 +125,7 @@ index ebcd303c..4bd178b7 100644
  
  /* Cache & XOR-Zlib - rdv@2002 */
 diff --git a/src/libvncserver/main.c b/src/libvncserver/main.c
-index d2c7aff1..803715d4 100644
+index d2c7aff..803715d 100644
 --- a/src/libvncserver/main.c
 +++ b/src/libvncserver/main.c
 @@ -425,6 +425,26 @@ void rfbMarkRegionAsModified(rfbScreenInfoPtr screen,sraRegionPtr modRegion)
@@ -156,7 +156,7 @@ index d2c7aff1..803715d4 100644
  void rfbMarkRectAsModified(rfbScreenInfoPtr screen,int x1,int y1,int x2,int y2)
  {
 diff --git a/src/libvncserver/rfbserver.c b/src/libvncserver/rfbserver.c
-index 5cb42654..ae405624 100644
+index 5cb4265..8548844 100644
 --- a/src/libvncserver/rfbserver.c
 +++ b/src/libvncserver/rfbserver.c
 @@ -2389,6 +2389,7 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
@@ -343,7 +343,7 @@ index 5cb42654..ae405624 100644
      if(i)
          sraRgnReleaseIterator(i);
      sraRgnDestroy(updateRegion);
-@@ -3668,6 +3753,67 @@ updateFailed:
+@@ -3668,6 +3753,61 @@ updateFailed:
  }
  
  
@@ -361,20 +361,11 @@ index 5cb42654..ae405624 100644
 +                            size_t frameSize)
 +{
 +    rfbFramebufferUpdateRectHeader rect;
-+    char *packet;
-+    size_t packetSize;
++    char header[sz_rfbFramebufferUpdateRectHeader + 8];
 +    uint32_t value;
 +
 +    if (frame == NULL || frameSize == 0 || frameSize > UINT32_MAX ||
-+        frameSize > SIZE_MAX - sz_rfbFramebufferUpdateRectHeader - 8)
-+        return FALSE;
-+
-+    packetSize = sz_rfbFramebufferUpdateRectHeader + 8 + frameSize;
-+    if (packetSize > INT_MAX)
-+        return FALSE;
-+
-+    packet = (char *)malloc(packetSize);
-+    if (packet == NULL)
++        frameSize > (size_t)INT_MAX - sizeof(header))
 +        return FALSE;
 +
 +    rect.r.x = 0;
@@ -382,24 +373,27 @@ index 5cb42654..ae405624 100644
 +    rect.r.w = Swap16IfLE(cl->screen->width);
 +    rect.r.h = Swap16IfLE(cl->screen->height);
 +    rect.encoding = Swap32IfLE(rfbEncodingOpenH264);
-+    memcpy(packet, &rect, sz_rfbFramebufferUpdateRectHeader);
++    memcpy(header, &rect, sz_rfbFramebufferUpdateRectHeader);
 +
 +    value = Swap32IfLE((uint32_t)frameSize);
-+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader, &value, sizeof(value));
++    memcpy(header + sz_rfbFramebufferUpdateRectHeader, &value, sizeof(value));
 +    value = 0;
-+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 4, &value,
++    memcpy(header + sz_rfbFramebufferUpdateRectHeader + 4, &value,
 +           sizeof(value));
-+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 8, frame, frameSize);
++
++    if (cl->ublen + (int)sizeof(header) > UPDATE_BUF_SIZE) {
++        if (!rfbSendUpdateBuf(cl))
++            return FALSE;
++    }
++    memcpy(cl->updateBuf + cl->ublen, header, sizeof(header));
++    cl->ublen += (int)sizeof(header);
 +
 +    if (!rfbSendUpdateBuf(cl) ||
-+        rfbWriteExact(cl, packet, (int)packetSize) < 0) {
-+        free(packet);
++        rfbWriteExact(cl, frame, (int)frameSize) < 0)
 +        return FALSE;
-+    }
-+    free(packet);
 +
 +    rfbStatRecordEncodingSent(cl, rfbEncodingOpenH264,
-+                              (int)packetSize,
++                              (int)(sizeof(header) + frameSize),
 +                              sz_rfbFramebufferUpdateRectHeader +
 +                              cl->screen->width *
 +                              (cl->format.bitsPerPixel / 8) *
@@ -412,7 +406,7 @@ index 5cb42654..ae405624 100644
   * Send the copy region as a string of CopyRect encoded rectangles.
   * The only slightly tricky thing is that we should send the messages in
 diff --git a/src/libvncserver/stats.c b/src/libvncserver/stats.c
-index 8af04e3f..c2b339ec 100644
+index 8af04e3..c2b339e 100644
 --- a/src/libvncserver/stats.c
 +++ b/src/libvncserver/stats.c
 @@ -106,6 +106,7 @@ char *encodingName(uint32_t type, char *buf, int len) {
