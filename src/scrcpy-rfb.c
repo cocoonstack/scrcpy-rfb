@@ -136,6 +136,11 @@ static AVFrame *publish_frame;
 static struct SwsContext *sws_context;
 static uint8_t *fallback_buffer;
 static size_t framebuffer_size;
+static struct scroll_row *scroll_old_rows;
+static struct scroll_row *scroll_new_rows;
+static int scroll_rows_capacity;
+static int scroll_scores[2 * SCROLL_MAX_SHIFT + 1];
+static int scroll_matches[2 * SCROLL_MAX_SHIFT + 1];
 static int fallback_frame_ready;
 static int fallback_decoder_ready_logged;
 static int mismatch_width;
@@ -1102,6 +1107,29 @@ static void describe_scroll_rows(const uint8_t *frame, int width, int height,
     }
 }
 
+/* Scratch for detect_vertical_scroll, grown at most twice per process (the
+ * self-test height, then the session height): the detector runs per published
+ * frame and must not pay four malloc/free cycles each time. */
+static int reserve_scroll_rows(int height) {
+    if (height <= scroll_rows_capacity) {
+        return 1;
+    }
+    struct scroll_row *grown_old = realloc(scroll_old_rows,
+                                           (size_t) height * sizeof(*grown_old));
+    if (!grown_old) {
+        return 0;
+    }
+    scroll_old_rows = grown_old;
+    struct scroll_row *grown_new = realloc(scroll_new_rows,
+                                           (size_t) height * sizeof(*grown_new));
+    if (!grown_new) {
+        return 0;
+    }
+    scroll_new_rows = grown_new;
+    scroll_rows_capacity = height;
+    return 1;
+}
+
 static int scroll_rows_match(const struct scroll_row *old_row,
                              const struct scroll_row *new_row) {
     unsigned difference = 0;
@@ -1137,19 +1165,17 @@ static int detect_vertical_scroll(const uint8_t *old_frame,
         return 0;
     }
 
-    struct scroll_row *old_rows = malloc((size_t) height * sizeof(*old_rows));
-    struct scroll_row *new_rows = malloc((size_t) height * sizeof(*new_rows));
-    /* scores/matches stay zeroed: the |dy| < SCROLL_MIN_SHIFT band is
-     * skipped by the scoring loop but still read when picking the best */
-    int *scores = calloc((size_t) (2 * maximum_shift + 1), sizeof(*scores));
-    int *matches = calloc((size_t) (2 * maximum_shift + 1), sizeof(*matches));
-    if (!old_rows || !new_rows || !scores || !matches) {
-        free(old_rows);
-        free(new_rows);
-        free(scores);
-        free(matches);
+    if (!reserve_scroll_rows(height)) {
         return 0;
     }
+    struct scroll_row *old_rows = scroll_old_rows;
+    struct scroll_row *new_rows = scroll_new_rows;
+    /* the |dy| < SCROLL_MIN_SHIFT band is skipped by the scoring loop but
+     * still read when picking the best, so it must start zeroed */
+    memset(scroll_scores, 0, sizeof(scroll_scores));
+    memset(scroll_matches, 0, sizeof(scroll_matches));
+    int *scores = scroll_scores;
+    int *matches = scroll_matches;
 
     describe_scroll_rows(old_frame, width, height, old_rows);
     describe_scroll_rows(new_frame, width, height, new_rows);
@@ -1201,10 +1227,6 @@ static int detect_vertical_scroll(const uint8_t *old_frame,
         }
     }
 
-    free(old_rows);
-    free(new_rows);
-    free(scores);
-    free(matches);
     if (best_matches < 10 || best_score < 450
             || (best_score < 800 && best_score - second_score < 100)) {
         return 0;
@@ -2247,6 +2269,8 @@ int main(int argc, char **argv) {
     avcodec_free_context(&decoder_context);
     free(fallback_buffer);
     free(damage_rects);
+    free(scroll_old_rows);
+    free(scroll_new_rows);
     pthread_mutex_lock(&frame_mutex);
     clear_frame_queue_locked();
     pthread_mutex_unlock(&frame_mutex);
