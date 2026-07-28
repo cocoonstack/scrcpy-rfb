@@ -128,6 +128,11 @@ static size_t codec_config_size;
 
 static AVCodecContext *decoder_context;
 static AVFrame *decoder_frame;
+/* Newest decoded frame, handed from the decoder thread to the publisher under
+ * fallback_mutex as a refcounted move: the critical section stays O(1) no
+ * matter how long the publisher's scale/diff work takes. */
+static AVFrame *pending_frame;
+static AVFrame *publish_frame;
 static struct SwsContext *sws_context;
 static uint8_t *fallback_buffer;
 static size_t framebuffer_size;
@@ -495,7 +500,9 @@ static int init_fallback_decoder(void) {
 
     decoder_context = avcodec_alloc_context3(codec);
     decoder_frame = av_frame_alloc();
-    if (!decoder_context || !decoder_frame
+    pending_frame = av_frame_alloc();
+    publish_frame = av_frame_alloc();
+    if (!decoder_context || !decoder_frame || !pending_frame || !publish_frame
             || avcodec_open2(decoder_context, codec, NULL) < 0) {
         fprintf(stderr, "failed to initialize H.264 fallback decoder\n");
         return -1;
@@ -561,34 +568,18 @@ static void decode_fallback_frame(const uint8_t *data, size_t size,
         mismatch_width = 0;
         mismatch_height = 0;
 
-        sws_context = sws_getCachedContext(
-                sws_context,
-                decoder_frame->width, decoder_frame->height,
-                (enum AVPixelFormat) decoder_frame->format,
-                video_width, video_height, AV_PIX_FMT_RGBA,
-                SWS_FAST_BILINEAR, NULL, NULL, NULL);
-        if (!sws_context) {
-            av_frame_unref(decoder_frame);
-            return;
-        }
-
-        uint8_t *destinations[] = {fallback_buffer, NULL, NULL, NULL};
-        int strides[] = {video_width * 4, 0, 0, 0};
         pthread_mutex_lock(&fallback_mutex);
-        sws_scale(sws_context,
-                  (const uint8_t *const *) decoder_frame->data,
-                  decoder_frame->linesize, 0, decoder_frame->height,
-                  destinations, strides);
+        av_frame_unref(pending_frame);
+        av_frame_move_ref(pending_frame, decoder_frame);
         fallback_frame_ready = 1;
         if (!fallback_decoder_ready_logged) {
             fprintf(stderr,
                     "ordinary VNC decoder ready: %dx%d format=%d\n",
-                    decoder_frame->width, decoder_frame->height,
-                    decoder_frame->format);
+                    pending_frame->width, pending_frame->height,
+                    pending_frame->format);
             fallback_decoder_ready_logged = 1;
         }
         pthread_mutex_unlock(&fallback_mutex);
-        av_frame_unref(decoder_frame);
     }
 }
 
@@ -1687,8 +1678,8 @@ static void adapt_client_jpeg(rfbClientPtr client,
 }
 
 /* Publish only pixels that differ from the last stable framebuffer. The
- * decoder owns a single pending buffer on purpose: when VNC output is slower
- * than Android, the newest image replaces the pending one instead of stale
+ * decoder owns a single pending frame on purpose: when VNC output is slower
+ * than Android, the newest frame replaces the pending one instead of stale
  * decoded frames queueing up. */
 static size_t publish_latest_fallback_frame(struct damage_rect *rects,
                                             size_t rect_capacity,
@@ -1709,7 +1700,7 @@ static size_t publish_latest_fallback_frame(struct damage_rect *rects,
     }
 
     /* Do not hold fallback_mutex while waiting for slow VNC readers. The
-     * decoder thread can keep replacing the pending image, and H.264
+     * decoder thread can keep replacing the pending frame, and H.264
      * passthrough stays independent of ordinary-client backpressure. */
     pthread_rwlock_wrlock(&screen_buffer_lock);
     pthread_mutex_lock(&fallback_mutex);
@@ -1718,6 +1709,31 @@ static size_t publish_latest_fallback_frame(struct damage_rect *rects,
         pthread_rwlock_unlock(&screen_buffer_lock);
         return 0;
     }
+    av_frame_move_ref(publish_frame, pending_frame);
+    fallback_frame_ready = 0;
+    pthread_mutex_unlock(&fallback_mutex);
+
+    /* YUV to RGBA conversion runs at the publish cadence, not the decode
+     * cadence: frames superseded while a publish was pending are never
+     * converted at all. fallback_buffer is only ever written here. */
+    sws_context = sws_getCachedContext(
+            sws_context,
+            publish_frame->width, publish_frame->height,
+            (enum AVPixelFormat) publish_frame->format,
+            video_width, video_height, AV_PIX_FMT_RGBA,
+            SWS_FAST_BILINEAR, NULL, NULL, NULL);
+    if (!sws_context) {
+        av_frame_unref(publish_frame);
+        pthread_rwlock_unlock(&screen_buffer_lock);
+        return 0;
+    }
+    uint8_t *destinations[] = {fallback_buffer, NULL, NULL, NULL};
+    int strides[] = {video_width * 4, 0, 0, 0};
+    sws_scale(sws_context,
+              (const uint8_t *const *) publish_frame->data,
+              publish_frame->linesize, 0, publish_frame->height,
+              destinations, strides);
+    av_frame_unref(publish_frame);
     *consumed = 1;
     pthread_mutex_lock(&screen_ready_mutex);
     int first_frame = !screen_frame_ready;
@@ -1815,13 +1831,11 @@ static size_t publish_latest_fallback_frame(struct damage_rect *rects,
         }
     }
 
-    fallback_frame_ready = 0;
     pthread_mutex_lock(&screen_ready_mutex);
     screen_frame_ready = 1;
     pthread_cond_broadcast(&screen_buffer_cond);
     pthread_mutex_unlock(&screen_ready_mutex);
     pthread_rwlock_unlock(&screen_buffer_lock);
-    pthread_mutex_unlock(&fallback_mutex);
     return rect_count;
 }
 
@@ -2107,6 +2121,7 @@ int main(int argc, char **argv) {
                 pthread_mutex_unlock(&screen_ready_mutex);
                 pthread_mutex_lock(&fallback_mutex);
                 fallback_frame_ready = 0;
+                av_frame_unref(pending_frame);
                 pthread_mutex_unlock(&fallback_mutex);
                 pthread_mutex_lock(&decode_mutex);
                 decode_skip_until_key = 0;
@@ -2222,6 +2237,8 @@ int main(int argc, char **argv) {
     free(codec_config);
     sws_freeContext(sws_context);
     av_frame_free(&decoder_frame);
+    av_frame_free(&pending_frame);
+    av_frame_free(&publish_frame);
     avcodec_free_context(&decoder_context);
     free(fallback_buffer);
     free(damage_rects);
