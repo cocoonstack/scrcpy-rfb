@@ -79,6 +79,7 @@ struct client_state {
     int ordinary_applied_jpeg_quality;
     int waiting_for_key_frame;
     int framebuffer_lock_held;
+    int mode_logged;
     int previous_left_button;
     int previous_wheel_buttons;
     int last_pointer_x;
@@ -158,6 +159,8 @@ static rfbClientPtr pointer_owner;
 
 static void client_gone(rfbClientPtr client);
 static int send_touch(uint8_t action, int x, int y, int pressed);
+static void log_client_mode_once(rfbClientPtr client,
+                                 struct client_state *state);
 
 static uint64_t monotonic_ns(void) {
     struct timespec now;
@@ -804,6 +807,7 @@ static rfbBool h264_frame_hook(rfbClientPtr client, char **buffer,
     if (!state) {
         return FALSE;
     }
+    log_client_mode_once(client, state);
     if (!copy_next_frame(state, &frame, &needs_keyframe, &more_pending)) {
         if (needs_keyframe) {
             int reset_sent = request_video_reset(0);
@@ -1628,6 +1632,23 @@ static int run_self_test(void) {
     return 0;
 }
 
+/* The Open H.264 patch assigns preferredEncoding without going through
+ * libvncserver's own "Using %s encoding" log, so a client that negotiated
+ * passthrough leaves no trace of it. Say so once per client. */
+static void log_client_mode_once(rfbClientPtr client,
+                                 struct client_state *state) {
+    if (state->mode_logged) {
+        return;
+    }
+    state->mode_logged = 1;
+    fprintf(stderr, "VNC client %s serving %s\n", client->host,
+            is_h264_encoding(client->preferredEncoding)
+                ? "H.264 passthrough"
+                : client->supportsH264Encoding
+                    ? "ordinary (H.264-capable, chose another encoding)"
+                    : "ordinary");
+}
+
 static void adapt_client_jpeg(rfbClientPtr client,
                               struct client_state *state) {
     if (client->preferredEncoding != rfbEncodingTight) {
@@ -1821,7 +1842,11 @@ static void display_hook(rfbClientPtr client) {
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
 
-    if (!state || is_h264_encoding(client->preferredEncoding)) {
+    if (!state) {
+        return;
+    }
+    log_client_mode_once(client, state);
+    if (is_h264_encoding(client->preferredEncoding)) {
         return;
     }
     adapt_client_jpeg(client, state);
