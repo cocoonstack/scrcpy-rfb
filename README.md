@@ -12,9 +12,10 @@ scrcpy 4.x server to one RFB/VNC port.
 ## Building
 
 The project depends on upstream [LibVNC/libvncserver](https://github.com/LibVNC/libvncserver)
-at a pinned commit, fetched at configure time, plus the two patches in
-`patches/` (the Open H.264 server-side encoding and a `deferUpdateTime=0`
-busy-loop fix). The patches have been submitted upstream; once merged, the
+at a pinned commit, fetched at configure time, plus the three patches in
+`patches/` (the Open H.264 server-side encoding, a `deferUpdateTime=0`
+busy-loop fix, and ExtendedClipboard notify from the client). The first two
+have been submitted upstream; once merged, the
 directory empties and the pin moves to a release tag.
 
 Release binaries (Ubuntu 22.04 ABI, static FFmpeg H.264 decoder):
@@ -35,8 +36,9 @@ make test   # build + run the self tests
 
 Pushes to `master` publish, via GitHub Actions:
 
-- `scrcpy-rfb-linux-amd64` / `-arm64` binaries, checksums and
-  `build-info.json` to the moving `master` prerelease;
+- `scrcpy-rfb-linux-amd64` / `-arm64` binaries, `su1000`, the patched
+  `scrcpy-server-secure.jar` and the unpatched `scrcpy-server.jar`, checksums
+  and `build-info.json` to the moving `master` prerelease;
 - a multi-arch container image at `ghcr.io/cocoonstack/scrcpy-rfb:master`
   (also tagged with the commit SHA):
 
@@ -54,9 +56,17 @@ its handshake. Then:
 
 ```sh
 scrcpy-rfb [--scrcpy-host 127.0.0.1] [--scrcpy-port 27183] \
-           [--turn-screen-off] \
+           [--clipboard-port PORT] [--turn-screen-off] \
            [libvncserver options]
 ```
+
+`--clipboard-port` connects a second, control-only scrcpy session
+(`video=false audio=false control=true`) and reads the Android clipboard from
+it. Android lets only a focused app, the IME or a holder of
+`READ_CLIPBOARD_IN_BACKGROUND` read the clipboard, so a server that runs as the
+system uid (the patched FLAG_SECURE server) cannot; the unpatched
+`scrcpy-server.jar` run as shell can. Without the option the main session reads
+it.
 
 `--turn-screen-off` asks the scrcpy server to power off the physical display
 after the video, control, and RFB paths are ready. Mirroring continues through
@@ -130,8 +140,17 @@ disable-display-resize: true
   `TCP_NOTSENT_LOWAT`, so slow connections apply backpressure instead of
   queueing stale updates.
 - Input: left button drags map to touch events with single-owner drag
-  arbitration across clients, wheel buttons map to Android scroll injection,
-  common keys map to Android keycodes and printable keysyms are injected as
-  UTF-8 text.
+  arbitration across clients, the right button is Back, wheel buttons map to
+  Android scroll injection, common keys (End, Insert and F1-F12 included) map
+  to Android keycodes with the held Shift, Control, Alt and Super as meta
+  state, and printable keysyms are injected as UTF-8 text. A letter or digit
+  with Control or Super becomes its keycode, and the X11 clipboard chords
+  Shift+Insert, Control+Insert and Shift+Delete become Control+V, C and X.
+- Clipboard: a client's cut text (Latin-1, or UTF-8 over the ExtendedClipboard
+  extension) becomes the Android clipboard without a paste of its own; the
+  client's paste key pastes it. A paste that arrives while the server is still
+  requesting text the client announced waits up to 2 s for that text. A new
+  Android clipboard goes to every client as ServerCutText, UTF-8 where the
+  client has the extension and Latin-1 otherwise.
 - The scrcpy session size is fixed; device rotation or resolution change
   requires a restart.

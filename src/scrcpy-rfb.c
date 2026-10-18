@@ -44,8 +44,36 @@
 #define SCRCPY_MSG_INJECT_TEXT 1
 #define SCRCPY_MSG_INJECT_TOUCH 2
 #define SCRCPY_MSG_INJECT_SCROLL 3
+#define SCRCPY_MSG_SET_CLIPBOARD 9
 #define SCRCPY_MSG_SET_DISPLAY_POWER 10
 #define SCRCPY_MSG_RESET_VIDEO 17
+#define SCRCPY_DEVICE_MSG_CLIPBOARD 0
+#define SCRCPY_MESSAGE_MAX_SIZE (1U << 18)
+#define SCRCPY_SET_CLIPBOARD_HEADER 14
+#define SCRCPY_CLIPBOARD_TEXT_MAX \
+    (SCRCPY_MESSAGE_MAX_SIZE - SCRCPY_SET_CLIPBOARD_HEADER)
+
+#define ANDROID_KEYCODE_BACK 4
+#define ANDROID_KEYCODE_0 7
+#define ANDROID_KEYCODE_A 29
+#define ANDROID_KEYCODE_C 31
+#define ANDROID_KEYCODE_V 50
+#define ANDROID_KEYCODE_X 52
+#define ANDROID_KEYCODE_F1 131
+#define ANDROID_META_SHIFT_ON 0x1U
+#define ANDROID_META_ALT_ON 0x2U
+#define ANDROID_META_ALT_LEFT_ON 0x10U
+#define ANDROID_META_ALT_RIGHT_ON 0x20U
+#define ANDROID_META_SHIFT_LEFT_ON 0x40U
+#define ANDROID_META_SHIFT_RIGHT_ON 0x80U
+#define ANDROID_META_CTRL_ON 0x1000U
+#define ANDROID_META_CTRL_LEFT_ON 0x2000U
+#define ANDROID_META_CTRL_RIGHT_ON 0x4000U
+#define ANDROID_META_META_ON 0x10000U
+#define ANDROID_META_META_LEFT_ON 0x20000U
+#define ANDROID_META_META_RIGHT_ON 0x40000U
+#define PASTE_DEFER_NS UINT64_C(2000000000)
+#define CLIPBOARD_ECHO_NS UINT64_C(1000000000)
 
 #define FRAME_QUEUE_CAPACITY 90
 #define H264_MAX_CATCH_UP_FRAMES 6
@@ -81,7 +109,10 @@ struct client_state {
     int framebuffer_lock_held;
     int mode_logged;
     int previous_left_button;
+    int previous_right_button;
     int previous_wheel_buttons;
+    uint32_t held_modifiers;
+    uint64_t paste_deferred_ns;
     int last_pointer_x;
     int last_pointer_y;
 };
@@ -101,6 +132,7 @@ struct scroll_row {
 struct bridge_options {
     const char *scrcpy_host;
     uint16_t scrcpy_port;
+    uint16_t clipboard_port;
     int turn_screen_off;
     int self_test;
     int help;
@@ -157,9 +189,15 @@ static pthread_mutex_t pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t control_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t reset_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t last_reset_request_ns;
+/* The clipboard text a client set last, so its echo is not sent back. */
+static char *clipboard_text;
+static size_t clipboard_length;
+static uint64_t clipboard_set_ns;
+static pthread_mutex_t clipboard_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int video_fd = -1;
 static int control_fd = -1;
+static int clipboard_fd = -1;
 static int video_width;
 static int video_height;
 static volatile sig_atomic_t running = 1;
@@ -169,6 +207,7 @@ static rfbClientPtr pointer_owner;
 
 static void client_gone(rfbClientPtr client);
 static int send_touch(uint8_t action, int x, int y, int pressed);
+static int send_keycode(uint8_t action, int keycode, uint32_t meta);
 static void log_client_mode_once(rfbClientPtr client,
                                  struct client_state *state);
 
@@ -276,18 +315,21 @@ static int parse_bridge_options(int *argc, char **argv,
             remove_arguments(argc, argv, i, 2);
             continue;
         }
-        if (strcmp(argv[i], "--scrcpy-port") == 0) {
+        if (strcmp(argv[i], "--scrcpy-port") == 0
+                || strcmp(argv[i], "--clipboard-port") == 0) {
             if (i + 1 >= *argc) {
-                fprintf(stderr, "--scrcpy-port requires a port\n");
+                fprintf(stderr, "%s requires a port\n", argv[i]);
                 return -1;
             }
             char *end;
             long port = strtol(argv[i + 1], &end, 10);
             if (!argv[i + 1][0] || *end || port <= 0 || port > 65535) {
-                fprintf(stderr, "invalid scrcpy port: %s\n", argv[i + 1]);
+                fprintf(stderr, "invalid %s: %s\n", argv[i], argv[i + 1]);
                 return -1;
             }
-            options->scrcpy_port = (uint16_t) port;
+            *(strcmp(argv[i], "--scrcpy-port") == 0
+                  ? &options->scrcpy_port
+                  : &options->clipboard_port) = (uint16_t) port;
             remove_arguments(argc, argv, i, 2);
             continue;
         }
@@ -770,11 +812,120 @@ static void *video_reader_main(void *unused) {
     return NULL;
 }
 
-static void *control_drain_main(void *unused) {
-    (void) unused;
+/* Reads the device message after its type byte: the Android clipboard into
+ * *text (NUL-terminated, the caller frees it). The bridge sets the clipboard
+ * without a sequence and creates no UHID device, so any other type is -1, as
+ * is a read error. */
+static int read_device_message(int fd, uint8_t type, char **text,
+                               uint32_t *length) {
+    uint8_t header[4];
+    if (type != SCRCPY_DEVICE_MSG_CLIPBOARD
+            || recv_all(fd, header, sizeof(header)) <= 0) {
+        return -1;
+    }
+    *length = AV_RB32(header);
+    if (*length > SCRCPY_MESSAGE_MAX_SIZE) {
+        return -1;
+    }
+    *text = malloc((size_t) *length + 1);
+    if (!*text || (*length && recv_all(fd, *text, *length) <= 0)) {
+        free(*text);
+        *text = NULL;
+        return -1;
+    }
+    (*text)[*length] = 0;
+    return 0;
+}
+
+/* Latin-1 rendering of UTF-8 text for clients without the extended
+ * clipboard: code points above U+00FF and malformed bytes become '?'. */
+static size_t utf8_to_latin1(const uint8_t *in, size_t length, char *out) {
+    size_t n = 0;
+    size_t i = 0;
+    while (i < length) {
+        uint8_t lead = in[i];
+        size_t extra = lead < 0x80 ? 0
+                     : (lead & 0xe0) == 0xc0 ? 1
+                     : (lead & 0xf0) == 0xe0 ? 2
+                     : (lead & 0xf8) == 0xf0 ? 3 : 4;
+        uint32_t code_point = extra ? lead & (0x3fU >> extra) : lead;
+        size_t j = 1;
+        while (extra < 4 && j <= extra && i + j < length
+                && (in[i + j] & 0xc0) == 0x80) {
+            code_point = (code_point << 6) | (in[i + j] & 0x3f);
+            ++j;
+        }
+        if (extra == 4 || j <= extra) {
+            out[n++] = '?';
+            ++i;
+            continue;
+        }
+        out[n++] = code_point <= 0xff ? (char) code_point : '?';
+        i += j;
+    }
+    return n;
+}
+
+static void remember_client_clipboard(const char *text, size_t length) {
+    char *copy = malloc(length ? length : 1);
+    if (copy) {
+        memcpy(copy, text, length);
+    }
+    pthread_mutex_lock(&clipboard_mutex);
+    free(clipboard_text);
+    clipboard_text = copy;
+    clipboard_length = copy ? length : 0;
+    clipboard_set_ns = monotonic_ns();
+    pthread_mutex_unlock(&clipboard_mutex);
+}
+
+/* An Android clipboard equal to the text a client set within
+ * CLIPBOARD_ECHO_NS is that set coming back. */
+static int clipboard_echo(const char *text, size_t length) {
+    pthread_mutex_lock(&clipboard_mutex);
+    int echo = clipboard_text && length == clipboard_length
+            && !memcmp(text, clipboard_text, length)
+            && monotonic_ns() - clipboard_set_ns < CLIPBOARD_ECHO_NS;
+    pthread_mutex_unlock(&clipboard_mutex);
+    return echo;
+}
+
+static void send_server_clipboard(char *text, uint32_t length) {
+    char *latin1 = malloc((size_t) length + 1);
+    if (!latin1) {
+        return;
+    }
+    size_t latin1_length = utf8_to_latin1((const uint8_t *) text, length,
+                                          latin1);
+    rfbSendServerCutTextUTF8(rfb_screen, text, (int) length, latin1,
+                             (int) latin1_length);
+    free(latin1);
+}
+
+/* A control socket carries device messages back: a new Android clipboard
+ * goes to every client as ServerCutText; once the stream is unreadable the
+ * rest is drained so the server never blocks on a full socket. */
+static void *control_reader_main(void *arg) {
+    int fd = (int) (intptr_t) arg;
     uint8_t buffer[4096];
     while (running) {
-        ssize_t n = recv(control_fd, buffer, sizeof(buffer), 0);
+        char *text = NULL;
+        uint32_t length = 0;
+        if (recv_all(fd, buffer, 1) <= 0) {
+            return NULL;
+        }
+        if (read_device_message(fd, buffer[0], &text, &length) < 0) {
+            fprintf(stderr, "unreadable scrcpy device message type %u\n",
+                    buffer[0]);
+            break;
+        }
+        if (rfb_ready && !clipboard_echo(text, length)) {
+            send_server_clipboard(text, length);
+        }
+        free(text);
+    }
+    while (running) {
+        ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             break;
         }
@@ -861,6 +1012,9 @@ static void client_gone(rfbClientPtr client) {
         pointer_owner = NULL;
     }
     pthread_mutex_unlock(&pointer_mutex);
+    if (state && state->previous_right_button) {
+        send_keycode(1, ANDROID_KEYCODE_BACK, 0);
+    }
     free(client->clientData);
     client->clientData = NULL;
     fprintf(stderr, "VNC client disconnected\n");
@@ -918,6 +1072,12 @@ static void pointer_event(int button_mask, int x, int y, rfbClientPtr client) {
         send_scroll(x, y, 1, 0);
     }
 
+    int right_button = !!(button_mask & 4);
+    if (right_button != state->previous_right_button) {
+        state->previous_right_button = right_button;
+        send_keycode(right_button ? 0 : 1, ANDROID_KEYCODE_BACK, 0);
+    }
+
     pthread_mutex_lock(&pointer_mutex);
     int left_button = !!(button_mask & 1);
     uint8_t action;
@@ -955,7 +1115,97 @@ done:
     pthread_mutex_unlock(&pointer_mutex);
 }
 
+static void encode_keycode(uint8_t message[14], uint8_t action, int keycode,
+                           uint32_t meta) {
+    memset(message, 0, 14);
+    message[0] = SCRCPY_MSG_INJECT_KEYCODE;
+    message[1] = action;
+    AV_WB32(message + 2, (uint32_t) keycode);
+    AV_WB32(message + 10, meta);
+}
+
+static int send_keycode(uint8_t action, int keycode, uint32_t meta) {
+    uint8_t message[14];
+    encode_keycode(message, action, keycode, meta);
+    return send_control(message, sizeof(message));
+}
+
+static void send_key_press(int keycode, uint32_t meta) {
+    send_keycode(0, keycode, meta);
+    send_keycode(1, keycode, meta);
+}
+
+/* The Android META_*_LEFT_ON or META_*_RIGHT_ON flag of a modifier keysym,
+ * 0 for any other key. Super is Android's Meta. */
+static uint32_t modifier_side_flag(rfbKeySym key) {
+    switch (key) {
+        case XK_Shift_L: return ANDROID_META_SHIFT_LEFT_ON;
+        case XK_Shift_R: return ANDROID_META_SHIFT_RIGHT_ON;
+        case XK_Control_L: return ANDROID_META_CTRL_LEFT_ON;
+        case XK_Control_R: return ANDROID_META_CTRL_RIGHT_ON;
+        case XK_Alt_L: return ANDROID_META_ALT_LEFT_ON;
+        case XK_Alt_R: return ANDROID_META_ALT_RIGHT_ON;
+        case XK_Meta_L:
+        case XK_Super_L: return ANDROID_META_META_LEFT_ON;
+        case XK_Meta_R:
+        case XK_Super_R: return ANDROID_META_META_RIGHT_ON;
+        default: return 0;
+    }
+}
+
+static uint32_t android_meta_state(uint32_t held) {
+    uint32_t meta = held;
+    if (held & (ANDROID_META_SHIFT_LEFT_ON | ANDROID_META_SHIFT_RIGHT_ON)) {
+        meta |= ANDROID_META_SHIFT_ON;
+    }
+    if (held & (ANDROID_META_ALT_LEFT_ON | ANDROID_META_ALT_RIGHT_ON)) {
+        meta |= ANDROID_META_ALT_ON;
+    }
+    if (held & (ANDROID_META_CTRL_LEFT_ON | ANDROID_META_CTRL_RIGHT_ON)) {
+        meta |= ANDROID_META_CTRL_ON;
+    }
+    if (held & (ANDROID_META_META_LEFT_ON | ANDROID_META_META_RIGHT_ON)) {
+        meta |= ANDROID_META_META_ON;
+    }
+    return meta;
+}
+
+/* A shortcut key pressed and released at once: the X11 clipboard chords
+ * Shift+Insert, Control+Insert and Shift+Delete become Control+V, C and X,
+ * and a letter or digit with Control or Meta becomes its keycode. Returns
+ * -1 for any other key. */
+static int shortcut_keycode(rfbKeySym key, uint32_t meta,
+                            uint32_t *shortcut_meta) {
+    *shortcut_meta = ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON;
+    if (key == XK_Insert && (meta & ANDROID_META_CTRL_ON)) {
+        return ANDROID_KEYCODE_C;
+    }
+    if (key == XK_Insert && (meta & ANDROID_META_SHIFT_ON)) {
+        return ANDROID_KEYCODE_V;
+    }
+    if (key == XK_Delete && (meta & ANDROID_META_SHIFT_ON)) {
+        return ANDROID_KEYCODE_X;
+    }
+    if (!(meta & (ANDROID_META_CTRL_ON | ANDROID_META_META_ON))) {
+        return -1;
+    }
+    *shortcut_meta = meta;
+    if (key >= XK_a && key <= XK_z) {
+        return ANDROID_KEYCODE_A + (int) (key - XK_a);
+    }
+    if (key >= XK_A && key <= XK_Z) {
+        return ANDROID_KEYCODE_A + (int) (key - XK_A);
+    }
+    if (key >= XK_0 && key <= XK_9) {
+        return ANDROID_KEYCODE_0 + (int) (key - XK_0);
+    }
+    return -1;
+}
+
 static int keysym_to_android_keycode(rfbKeySym key) {
+    if (key >= XK_F1 && key <= XK_F12) {
+        return ANDROID_KEYCODE_F1 + (int) (key - XK_F1);
+    }
     switch (key) {
         case XK_Home: return 3;
         case XK_Escape: return 4;
@@ -971,6 +1221,8 @@ static int keysym_to_android_keycode(rfbKeySym key) {
         case XK_Page_Up: return 92;
         case XK_Page_Down: return 93;
         case XK_Delete: return 112;
+        case XK_End: return 123;
+        case XK_Insert: return 124;
         default: return -1;
     }
 }
@@ -1004,17 +1256,128 @@ static size_t utf8_encode(uint32_t code_point, uint8_t *out) {
     return 0;
 }
 
-/* Printable keysyms become scrcpy UTF-8 text injection: ASCII and Latin-1
- * map directly, X11 Unicode keysyms carry the code point in the low bits. */
+/* A paste sent while the client's announced text is still being requested
+ * waits for that text and runs when it arrives, within PASTE_DEFER_NS. */
+static int defer_paste(rfbClientPtr client, struct client_state *state) {
+    if (!client->extClipboardRequested) {
+        return 0;
+    }
+    uint64_t now = monotonic_ns();
+    if (!state->paste_deferred_ns) {
+        state->paste_deferred_ns = now;
+        return 1;
+    }
+    if (now - state->paste_deferred_ns < PASTE_DEFER_NS) {
+        return 1;
+    }
+    client->extClipboardRequested = FALSE;
+    state->paste_deferred_ns = 0;
+    return 0;
+}
+
+/* Copies text into a SET_CLIPBOARD message without its trailing NULs and
+ * with CRLF as LF, cut to the scrcpy limit on a UTF-8 boundary. message
+ * holds SCRCPY_SET_CLIPBOARD_HEADER + min(length, SCRCPY_CLIPBOARD_TEXT_MAX)
+ * bytes; returns the message size. */
+static size_t encode_set_clipboard(const char *text, size_t length,
+                                   uint8_t *message) {
+    while (length && !text[length - 1]) {
+        --length;
+    }
+    uint8_t *out = message + SCRCPY_SET_CLIPBOARD_HEADER;
+    size_t n = 0;
+    size_t i = 0;
+    for (; i < length && n < SCRCPY_CLIPBOARD_TEXT_MAX; ++i) {
+        if (text[i] == '\r' && i + 1 < length && text[i + 1] == '\n') {
+            continue;
+        }
+        out[n++] = (uint8_t) text[i];
+    }
+    if (i < length) {
+        uint8_t next = (uint8_t) text[i];
+        while (n && (next & 0xc0) == 0x80) {
+            next = out[--n];
+        }
+    }
+    memset(message, 0, SCRCPY_SET_CLIPBOARD_HEADER);
+    message[0] = SCRCPY_MSG_SET_CLIPBOARD;
+    AV_WB32(message + 10, (uint32_t) n);
+    return SCRCPY_SET_CLIPBOARD_HEADER + n;
+}
+
+/* The client's clipboard becomes Android's, with no paste of its own: the
+ * client's paste key does that, or the paste deferred for this text. */
+static void forward_clipboard(const char *text, size_t length,
+                              rfbClientPtr client) {
+    struct client_state *state = client->clientData;
+    size_t capacity = SCRCPY_SET_CLIPBOARD_HEADER
+                    + (length < SCRCPY_CLIPBOARD_TEXT_MAX
+                           ? length : SCRCPY_CLIPBOARD_TEXT_MAX);
+    uint8_t *message = malloc(capacity);
+    if (!message) {
+        return;
+    }
+    size_t size = encode_set_clipboard(text, length, message);
+    remember_client_clipboard(
+            (const char *) message + SCRCPY_SET_CLIPBOARD_HEADER,
+            size - SCRCPY_SET_CLIPBOARD_HEADER);
+    send_control(message, size);
+    free(message);
+    if (state->paste_deferred_ns) {
+        if (monotonic_ns() - state->paste_deferred_ns < PASTE_DEFER_NS) {
+            send_key_press(ANDROID_KEYCODE_V,
+                           ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON);
+        }
+        state->paste_deferred_ns = 0;
+    }
+}
+
+static void set_clipboard_utf8(char *text, int length, rfbClientPtr client) {
+    forward_clipboard(text, (size_t) length, client);
+}
+
+static void set_clipboard_latin1(char *text, int length,
+                                 rfbClientPtr client) {
+    char *utf8 = malloc(2 * (size_t) length + 1);
+    if (!utf8) {
+        return;
+    }
+    size_t n = 0;
+    for (int i = 0; i < length; ++i) {
+        n += utf8_encode((uint8_t) text[i], (uint8_t *) utf8 + n);
+    }
+    forward_clipboard(utf8, n, client);
+    free(utf8);
+}
+
+/* Modifiers set the meta state of the keys that follow. Printable keysyms
+ * become scrcpy UTF-8 text injection: ASCII and Latin-1 map directly, X11
+ * Unicode keysyms carry the code point in the low bits. */
 static void keyboard_event(rfbBool down, rfbKeySym key, rfbClientPtr client) {
-    (void) client;
-    int keycode = keysym_to_android_keycode(key);
+    struct client_state *state = client->clientData;
+    uint32_t side = modifier_side_flag(key);
+    if (side) {
+        if (down) {
+            state->held_modifiers |= side;
+        } else {
+            state->held_modifiers &= ~side;
+        }
+        return;
+    }
+
+    uint32_t meta = android_meta_state(state->held_modifiers);
+    uint32_t shortcut_meta;
+    int keycode = shortcut_keycode(key, meta, &shortcut_meta);
     if (keycode >= 0) {
-        uint8_t message[14] = {0};
-        message[0] = SCRCPY_MSG_INJECT_KEYCODE;
-        message[1] = down ? 0 : 1;
-        AV_WB32(message + 2, (uint32_t) keycode);
-        send_control(message, sizeof(message));
+        if (down && !(keycode == ANDROID_KEYCODE_V
+                      && defer_paste(client, state))) {
+            send_key_press(keycode, shortcut_meta);
+        }
+        return;
+    }
+    keycode = keysym_to_android_keycode(key);
+    if (keycode >= 0) {
+        send_keycode(down ? 0 : 1, keycode, meta);
         return;
     }
 
@@ -1525,6 +1888,276 @@ done:
     return 0;
 }
 
+/* Reads the next control message, of size bytes, the test expects. */
+static int expect_control(int fd, const uint8_t *expected, size_t size) {
+    uint8_t message[64];
+    return size <= sizeof(message)
+        && recv(fd, message, size, MSG_DONTWAIT) == (ssize_t) size
+        && !memcmp(message, expected, size);
+}
+
+static int expect_key_press(int fd, int keycode, uint32_t meta) {
+    uint8_t down[14];
+    uint8_t up[14];
+    encode_keycode(down, 0, keycode, meta);
+    encode_keycode(up, 1, keycode, meta);
+    return expect_control(fd, down, sizeof(down))
+        && expect_control(fd, up, sizeof(up));
+}
+
+static int control_idle(int fd) {
+    uint8_t byte;
+    return recv(fd, &byte, 1, MSG_DONTWAIT) < 0;
+}
+
+static int input_self_test(void) {
+    const uint32_t ctrl = ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON;
+    const uint32_t shift = ANDROID_META_SHIFT_ON | ANDROID_META_SHIFT_LEFT_ON;
+    int saved_control_fd = control_fd;
+    int control_pair[2];
+    struct client_state state = {0};
+    struct _rfbClientRec client;
+    const char *failure = NULL;
+    uint8_t message[14];
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control_pair) < 0) {
+        fprintf(stderr, "input self-test: no socket pair\n");
+        return 1;
+    }
+    control_fd = control_pair[0];
+    memset(&client, 0, sizeof(client));
+    client.clientData = &state;
+    int fd = control_pair[1];
+
+    keyboard_event(TRUE, XK_Control_L, &client);
+    keyboard_event(TRUE, XK_a, &client);
+    keyboard_event(FALSE, XK_a, &client);
+    keyboard_event(FALSE, XK_Control_L, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_A, ctrl) || !control_idle(fd)) {
+        failure = "Control+A is not one KEYCODE_A press with Control";
+        goto done;
+    }
+
+    keyboard_event(TRUE, XK_Shift_L, &client);
+    keyboard_event(TRUE, XK_Tab, &client);
+    encode_keycode(message, 0, 61, shift);
+    if (!expect_control(fd, message, sizeof(message))) {
+        failure = "Shift+Tab lost its Shift meta state";
+        goto done;
+    }
+    keyboard_event(FALSE, XK_Tab, &client);
+    encode_keycode(message, 1, 61, shift);
+    if (!expect_control(fd, message, sizeof(message))) {
+        failure = "Shift+Tab release lost its Shift meta state";
+        goto done;
+    }
+    keyboard_event(TRUE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Insert, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_V, ctrl)) {
+        failure = "Shift+Insert is not Control+V";
+        goto done;
+    }
+    keyboard_event(TRUE, XK_Delete, &client);
+    keyboard_event(FALSE, XK_Delete, &client);
+    keyboard_event(FALSE, XK_Shift_L, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_X, ctrl)) {
+        failure = "Shift+Delete is not Control+X";
+        goto done;
+    }
+    keyboard_event(TRUE, XK_Control_R, &client);
+    keyboard_event(TRUE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Control_R, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_C, ctrl) || !control_idle(fd)) {
+        failure = "Control+Insert is not Control+C";
+        goto done;
+    }
+
+    const struct {
+        rfbKeySym key;
+        int keycode;
+    } keys[] = {{XK_End, 123}, {XK_Insert, 124}, {XK_F1, 131}, {XK_F12, 142}};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        keyboard_event(TRUE, keys[i].key, &client);
+        keyboard_event(FALSE, keys[i].key, &client);
+        encode_keycode(message, 0, keys[i].keycode, 0);
+        if (!expect_control(fd, message, sizeof(message))) {
+            failure = "End, Insert or an F-key has no Android keycode";
+            goto done;
+        }
+        encode_keycode(message, 1, keys[i].keycode, 0);
+        if (!expect_control(fd, message, sizeof(message))) {
+            failure = "End, Insert or an F-key has no release";
+            goto done;
+        }
+    }
+
+    keyboard_event(TRUE, XK_Shift_L, &client);
+    keyboard_event(TRUE, XK_B, &client);
+    keyboard_event(FALSE, XK_B, &client);
+    keyboard_event(FALSE, XK_Shift_L, &client);
+    const uint8_t text_b[] = {SCRCPY_MSG_INJECT_TEXT, 0, 0, 0, 1, 'B'};
+    if (!expect_control(fd, text_b, sizeof(text_b)) || !control_idle(fd)) {
+        failure = "Shift+B is not the text B";
+        goto done;
+    }
+
+    pointer_event(4, 10, 20, &client);
+    pointer_event(0, 10, 20, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_BACK, 0) || !control_idle(fd)) {
+        failure = "the right button is not Back";
+        goto done;
+    }
+
+done:
+    control_fd = saved_control_fd;
+    close(control_pair[0]);
+    close(control_pair[1]);
+    if (failure) {
+        fprintf(stderr, "input self-test failed: %s\n", failure);
+        return 1;
+    }
+    return 0;
+}
+
+static int clipboard_self_test(void) {
+    const uint32_t ctrl = ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON;
+    int saved_control_fd = control_fd;
+    int control_pair[2];
+    int device_pair[2] = {-1, -1};
+    struct client_state state = {0};
+    struct _rfbClientRec client;
+    const char *failure = NULL;
+    uint8_t *big = NULL;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control_pair) < 0) {
+        fprintf(stderr, "clipboard self-test: no socket pair\n");
+        return 1;
+    }
+    control_fd = control_pair[0];
+    memset(&client, 0, sizeof(client));
+    client.clientData = &state;
+    int fd = control_pair[1];
+
+    char utf8[] = "\xe4\xbd\xa0\xe5\xa5\xbd abc\r\n";
+    client.extClipboardRequested = TRUE;
+    keyboard_event(TRUE, XK_Shift_L, &client);
+    keyboard_event(TRUE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Shift_L, &client);
+    if (!control_idle(fd)) {
+        failure = "a paste ran before the requested text arrived";
+        goto done;
+    }
+    client.extClipboardRequested = FALSE;
+    set_clipboard_utf8(utf8, sizeof(utf8), &client);
+    const uint8_t set_utf8[] = {
+        SCRCPY_MSG_SET_CLIPBOARD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
+        0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd, ' ', 'a', 'b', 'c', '\n',
+    };
+    if (!expect_control(fd, set_utf8, sizeof(set_utf8))
+            || !expect_key_press(fd, ANDROID_KEYCODE_V, ctrl)
+            || !control_idle(fd)) {
+        failure = "the deferred paste did not follow its UTF-8 text";
+        goto done;
+    }
+
+    char latin1[] = "caf\xe9";
+    set_clipboard_latin1(latin1, 4, &client);
+    const uint8_t set_latin1[] = {
+        SCRCPY_MSG_SET_CLIPBOARD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+        'c', 'a', 'f', 0xc3, 0xa9,
+    };
+    if (!expect_control(fd, set_latin1, sizeof(set_latin1))
+            || !control_idle(fd)) {
+        failure = "Latin-1 cut text did not arrive as UTF-8 without a paste";
+        goto done;
+    }
+    if (!clipboard_echo("caf\xc3\xa9", 5) || clipboard_echo("x", 1)) {
+        failure = "the echo of a client's clipboard was not recognized";
+        goto done;
+    }
+    clipboard_set_ns -= CLIPBOARD_ECHO_NS;
+    if (clipboard_echo("caf\xc3\xa9", 5)) {
+        failure = "a later copy of a client's clipboard counted as its echo";
+        goto done;
+    }
+
+    size_t big_length = SCRCPY_CLIPBOARD_TEXT_MAX + 3;
+    big = malloc(SCRCPY_SET_CLIPBOARD_HEADER + 2 * big_length);
+    if (!big) {
+        failure = "no memory for the long clipboard";
+        goto done;
+    }
+    uint8_t *long_text = big + SCRCPY_SET_CLIPBOARD_HEADER + big_length;
+    for (size_t i = 0; i < big_length; ++i) {
+        long_text[i] = "\xe4\xbd\xa0"[i % 3];
+    }
+    size_t size = encode_set_clipboard((const char *) long_text, big_length,
+                                       big);
+    size_t kept = size - SCRCPY_SET_CLIPBOARD_HEADER;
+    if (kept > SCRCPY_CLIPBOARD_TEXT_MAX || kept % 3
+            || AV_RB32(big + 10) != kept
+            || kept + 3 <= SCRCPY_CLIPBOARD_TEXT_MAX) {
+        failure = "a long clipboard was not cut on a UTF-8 boundary";
+        goto done;
+    }
+
+    char decoded[16];
+    const uint8_t mixed[] = {0xe4, 0xbd, 0xa0, ' ', 'a', 0xc3, 0xa9, 0xff, 0xe4};
+    size_t decoded_length = utf8_to_latin1(mixed, sizeof(mixed), decoded);
+    if (decoded_length != 6 || memcmp(decoded, "? a\xe9??", 6)) {
+        failure = "UTF-8 to Latin-1 fallback is wrong";
+        goto done;
+    }
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, device_pair) < 0) {
+        failure = "no device socket pair";
+        goto done;
+    }
+    const uint8_t device[] = {
+        SCRCPY_DEVICE_MSG_CLIPBOARD, 0, 0, 0, 5, 'h', 'e', 'l', 'l', 'o', 0x7f,
+    };
+    if (send_all(device_pair[0], device, sizeof(device)) < 0) {
+        failure = "device messages were not written";
+        goto done;
+    }
+    int statuses[2];
+    char *text = NULL;
+    uint32_t length = 0;
+    for (int i = 0; i < 2; ++i) {
+        uint8_t type;
+        statuses[i] = recv_all(device_pair[1], &type, 1) > 0
+                    ? read_device_message(device_pair[1], type, &text, &length)
+                    : -2;
+    }
+    int read_hello = text && length == 5 && !strcmp(text, "hello");
+    free(text);
+    if (statuses[0] || statuses[1] != -1 || !read_hello) {
+        failure = "device messages were misread";
+        goto done;
+    }
+
+done:
+    free(big);
+    free(clipboard_text);
+    clipboard_text = NULL;
+    clipboard_length = 0;
+    clipboard_set_ns = 0;
+    control_fd = saved_control_fd;
+    close(control_pair[0]);
+    close(control_pair[1]);
+    if (device_pair[0] >= 0) {
+        close(device_pair[0]);
+        close(device_pair[1]);
+    }
+    if (failure) {
+        fprintf(stderr, "clipboard self-test failed: %s\n", failure);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_self_test(void) {
     const int width = 320;
     const int height = 480;
@@ -1533,6 +2166,9 @@ static int run_self_test(void) {
         return 1;
     }
     if (fallback_decode_resync_self_test()) {
+        return 1;
+    }
+    if (input_self_test() || clipboard_self_test()) {
         return 1;
     }
     size_t size = (size_t) width * (size_t) height * 4;
@@ -1612,8 +2248,10 @@ static int run_self_test(void) {
     char arg5[] = "12345";
     char arg6[] = "-rfbport";
     char arg7[] = "5901";
+    char arg8[] = "--clipboard-port";
+    char arg9[] = "27184";
     char *test_argv[] = {
-        arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, NULL,
+        arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, NULL,
     };
     int test_argc = (int) (sizeof(test_argv) / sizeof(test_argv[0])) - 1;
     struct bridge_options test_options;
@@ -1621,6 +2259,7 @@ static int run_self_test(void) {
             || !test_options.turn_screen_off
             || strcmp(test_options.scrcpy_host, "127.0.0.2") != 0
             || test_options.scrcpy_port != 12345
+            || test_options.clipboard_port != 27184
             || test_argc != 3
             || strcmp(test_argv[1], "-rfbport") != 0
             || strcmp(test_argv[2], "5901") != 0
@@ -1962,6 +2601,9 @@ static void usage(const char *program) {
             "\n"
             "  --scrcpy-host addr   scrcpy server IPv4 address (default %s)\n"
             "  --scrcpy-port port   scrcpy server TCP port (default %d)\n"
+            "  --clipboard-port port\n"
+            "                       control-only scrcpy session that reads the\n"
+            "                       Android clipboard (one running as shell)\n"
             "  --turn-screen-off    turn the physical display off while running\n"
             "  --self-test          run built-in self tests and exit\n"
             "  --help               show this help\n"
@@ -2004,6 +2646,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to connect scrcpy control socket\n");
         return 1;
     }
+    if (options.clipboard_port) {
+        clipboard_fd = connect_tcp(options.scrcpy_host, options.clipboard_port);
+        if (clipboard_fd < 0) {
+            fprintf(stderr, "failed to connect scrcpy clipboard socket\n");
+            return 1;
+        }
+    }
 
     uint8_t codec_header[4];
     uint8_t session_header[12];
@@ -2030,9 +2679,15 @@ int main(int argc, char **argv) {
 
     pthread_t video_thread;
     pthread_t control_thread;
+    pthread_t clipboard_thread;
     pthread_t decoder_thread;
     pthread_create(&video_thread, NULL, video_reader_main, NULL);
-    pthread_create(&control_thread, NULL, control_drain_main, NULL);
+    pthread_create(&control_thread, NULL, control_reader_main,
+                   (void *) (intptr_t) control_fd);
+    if (clipboard_fd >= 0) {
+        pthread_create(&clipboard_thread, NULL, control_reader_main,
+                       (void *) (intptr_t) clipboard_fd);
+    }
     pthread_create(&decoder_thread, NULL, decoder_main, NULL);
 
     rfb_screen = rfbGetScreen(&argc, argv, video_width, video_height, 8, 3, 4);
@@ -2061,6 +2716,8 @@ int main(int argc, char **argv) {
     rfb_screen->newClientHook = new_client;
     rfb_screen->ptrAddEvent = pointer_event;
     rfb_screen->kbdAddEvent = keyboard_event;
+    rfb_screen->setXCutText = set_clipboard_latin1;
+    rfb_screen->setXCutTextUTF8 = set_clipboard_utf8;
     rfb_screen->getH264FrameHook = h264_frame_hook;
     rfb_screen->displayHook = display_hook;
     rfb_screen->displayFinishedHook = display_finished_hook;
@@ -2231,6 +2888,9 @@ int main(int argc, char **argv) {
     rfbShutdownServer(rfb_screen, TRUE);
     shutdown(video_fd, SHUT_RDWR);
     shutdown(control_fd, SHUT_RDWR);
+    if (clipboard_fd >= 0) {
+        shutdown(clipboard_fd, SHUT_RDWR);
+    }
     pthread_mutex_lock(&decode_mutex);
     pthread_cond_broadcast(&decode_cond);
     pthread_mutex_unlock(&decode_mutex);
@@ -2239,6 +2899,10 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&screen_ready_mutex);
     pthread_join(video_thread, NULL);
     pthread_join(control_thread, NULL);
+    if (clipboard_fd >= 0) {
+        pthread_join(clipboard_thread, NULL);
+        close(clipboard_fd);
+    }
     pthread_join(decoder_thread, NULL);
 
     close(video_fd);
@@ -2253,6 +2917,7 @@ int main(int argc, char **argv) {
     free(damage_rects);
     free(scroll_old_rows);
     free(scroll_new_rows);
+    free(clipboard_text);
     pthread_mutex_lock(&frame_mutex);
     clear_frame_queue_locked();
     pthread_mutex_unlock(&frame_mutex);
