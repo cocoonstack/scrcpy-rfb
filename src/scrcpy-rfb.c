@@ -119,6 +119,7 @@ struct client_state {
     uint32_t held_modifiers;
     uint64_t paste_deferred_ns;
     int pastes_deferred;
+    int text_wait_over;
     int last_pointer_x;
     int last_pointer_y;
 };
@@ -1320,12 +1321,17 @@ static size_t utf8_encode(uint32_t code_point, uint8_t *out) {
 }
 
 /* A paste sent while the client's announced text is still being requested
- * waits for that text; each press counts. */
+ * waits for that text; each press counts. Once a wait timed out, later
+ * presses paste at once until the client's next text arrives. */
 static int defer_paste(rfbClientPtr client, struct client_state *state) {
     if (!client->extClipboardRequested) {
         return 0;
     }
     pthread_mutex_lock(&paste_mutex);
+    if (state->text_wait_over) {
+        pthread_mutex_unlock(&paste_mutex);
+        return 0;
+    }
     if (!state->pastes_deferred) {
         state->paste_deferred_ns = monotonic_ns();
     }
@@ -1335,27 +1341,31 @@ static int defer_paste(rfbClientPtr client, struct client_state *state) {
     return 1;
 }
 
-/* Runs a client's deferred pastes: when its text arrives, or, with expired,
- * once PASTE_DEFER_NS passed without it, on the clipboard Android has. */
-static void run_deferred_pastes(rfbClientPtr client, int expired) {
-    struct client_state *state = client->clientData;
+/* Runs a client's deferred pastes when its text arrives. */
+static void run_deferred_pastes(struct client_state *state) {
     pthread_mutex_lock(&paste_mutex);
     int pastes = state->pastes_deferred;
-    if (expired && monotonic_ns() - state->paste_deferred_ns < PASTE_DEFER_NS) {
-        pastes = 0;
-    }
-    if (pastes) {
-        state->pastes_deferred = 0;
-        pastes_pending -= pastes;
-        if (expired) {
-            client->extClipboardRequested = FALSE;
-        }
-    }
+    state->pastes_deferred = 0;
+    state->text_wait_over = 0;
+    pastes_pending -= pastes;
     pthread_mutex_unlock(&paste_mutex);
     for (int i = 0; i < pastes; ++i) {
         send_key_press(ANDROID_KEYCODE_V,
                        ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON);
     }
+}
+
+/* Drops a client's deferred pastes once PASTE_DEFER_NS passed without its
+ * text, since a paste of Android's older clipboard is worse than none. */
+static void drop_expired_pastes(struct client_state *state) {
+    pthread_mutex_lock(&paste_mutex);
+    if (state->pastes_deferred
+            && monotonic_ns() - state->paste_deferred_ns >= PASTE_DEFER_NS) {
+        pastes_pending -= state->pastes_deferred;
+        state->pastes_deferred = 0;
+        state->text_wait_over = 1;
+    }
+    pthread_mutex_unlock(&paste_mutex);
 }
 
 static void expire_deferred_pastes(void) {
@@ -1369,7 +1379,7 @@ static void expire_deferred_pastes(void) {
     rfbClientPtr client;
     while ((client = rfbClientIteratorNext(iterator)) != NULL) {
         if (client->clientData) {
-            run_deferred_pastes(client, 1);
+            drop_expired_pastes(client->clientData);
         }
     }
     rfbReleaseClientIterator(iterator);
@@ -1422,7 +1432,7 @@ static void forward_clipboard(const char *text, size_t length,
             size - SCRCPY_SET_CLIPBOARD_HEADER);
     send_control(message, size);
     free(message);
-    run_deferred_pastes(client, 0);
+    run_deferred_pastes(client->clientData);
 }
 
 static void set_clipboard_utf8(char *text, int length, rfbClientPtr client) {
@@ -2176,16 +2186,31 @@ static int clipboard_self_test(void) {
     keyboard_event(TRUE, XK_Insert, &client);
     keyboard_event(FALSE, XK_Insert, &client);
     keyboard_event(FALSE, XK_Shift_L, &client);
-    run_deferred_pastes(&client, 1);
-    if (!control_idle(fd)) {
-        failure = "a deferred paste ran before its timeout";
+    drop_expired_pastes(&state);
+    if (!control_idle(fd) || state.pastes_deferred != 1) {
+        failure = "a deferred paste was dropped before its timeout";
         goto done;
     }
     state.paste_deferred_ns -= PASTE_DEFER_NS;
-    run_deferred_pastes(&client, 1);
-    if (!expect_key_press(fd, ANDROID_KEYCODE_V, ctrl) || !control_idle(fd)
-            || client.extClipboardRequested || pastes_pending) {
-        failure = "a deferred paste whose text never came did not run at its timeout";
+    drop_expired_pastes(&state);
+    if (!control_idle(fd) || state.pastes_deferred || pastes_pending
+            || !client.extClipboardRequested) {
+        failure = "a deferred paste whose text never came was not dropped at its timeout";
+        goto done;
+    }
+    keyboard_event(TRUE, XK_Control_L, &client);
+    keyboard_event(TRUE, XK_v, &client);
+    keyboard_event(FALSE, XK_v, &client);
+    keyboard_event(FALSE, XK_Control_L, &client);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_V, ctrl) || !control_idle(fd)) {
+        failure = "a paste after a timed-out wait did not run at once";
+        goto done;
+    }
+    client.extClipboardRequested = FALSE;
+    set_clipboard_utf8(utf8, sizeof(utf8), &client);
+    if (!expect_control(fd, set_utf8, sizeof(set_utf8)) || !control_idle(fd)
+            || state.text_wait_over) {
+        failure = "the client's next text did not end the timed-out wait";
         goto done;
     }
 
