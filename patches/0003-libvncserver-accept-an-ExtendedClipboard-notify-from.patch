@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From ac18f357ee9c2cf052f9ed11c63a441cac028c83 Mon Sep 17 00:00:00 2001
 From: CMGS <ilskdw@gmail.com>
 Date: Mon, 19 Oct 2026 03:25:51 +0800
 Subject: [PATCH] libvncserver: accept an ExtendedClipboard notify from the
@@ -18,10 +18,10 @@ an application can hold a paste that the client sent ahead of its text.
  2 files changed, 32 insertions(+), 1 deletion(-)
 
 diff --git a/include/rfb/rfb.h b/include/rfb/rfb.h
-index 90b4aec..3864e7b 100644
+index e225c034..2d7af39c 100644
 --- a/include/rfb/rfb.h
 +++ b/include/rfb/rfb.h
-@@ -744,6 +744,8 @@ typedef struct _rfbClientRec {
+@@ -723,6 +723,8 @@ typedef struct _rfbClientRec {
      uint32_t extClipboardMaxUnsolicitedSize;
      char *extClipboardData;
      int extClipboardDataSize;
@@ -31,7 +31,7 @@ index 90b4aec..3864e7b 100644
  #ifdef LIBVNCSERVER_HAVE_LIBJPEG
      /* Tight encoding internal variables, stored per-client for thread safety */
 diff --git a/src/libvncserver/rfbserver.c b/src/libvncserver/rfbserver.c
-index de4b6cc..29abb09 100644
+index 5cb42654..88ac1a04 100644
 --- a/src/libvncserver/rfbserver.c
 +++ b/src/libvncserver/rfbserver.c
 @@ -2124,7 +2124,7 @@ rfbSendExtendedClipboardCapability(rfbClientPtr cl) {
@@ -69,7 +69,7 @@ index de4b6cc..29abb09 100644
  static rfbBool
  rfbSendExtendedServerCutTextData(rfbClientPtr cl, const char *data, int len) {
      int i;
-@@ -3005,7 +3024,17 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
+@@ -2996,7 +3015,17 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
                      return;
                  }
              }

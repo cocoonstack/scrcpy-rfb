@@ -61,8 +61,10 @@ scrcpy-rfb [--scrcpy-host 127.0.0.1] [--scrcpy-port 27183] \
 ```
 
 `--clipboard-port` connects a second, control-only scrcpy session
-(`video=false audio=false control=true`) and reads the Android clipboard from
-it. Android lets only a focused app, the IME or a holder of
+(`video=false audio=false control=true send_device_meta=false
+send_dummy_byte=false`; the preamble would otherwise land on the control
+socket, where the bridge reads device messages) and reads the Android
+clipboard from it. Android lets only a focused app, the IME or a holder of
 `READ_CLIPBOARD_IN_BACKGROUND` read the clipboard, so a server that runs as the
 system uid (the patched FLAG_SECURE server) cannot; the unpatched
 `scrcpy-server.jar` run as shell can. Without the option the main session reads

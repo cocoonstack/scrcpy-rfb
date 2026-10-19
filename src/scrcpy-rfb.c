@@ -327,9 +327,11 @@ static int parse_bridge_options(int *argc, char **argv,
                 fprintf(stderr, "invalid %s: %s\n", argv[i], argv[i + 1]);
                 return -1;
             }
-            *(strcmp(argv[i], "--scrcpy-port") == 0
-                  ? &options->scrcpy_port
-                  : &options->clipboard_port) = (uint16_t) port;
+            if (strcmp(argv[i], "--scrcpy-port") == 0) {
+                options->scrcpy_port = (uint16_t) port;
+            } else {
+                options->clipboard_port = (uint16_t) port;
+            }
             remove_arguments(argc, argv, i, 2);
             continue;
         }
@@ -837,8 +839,6 @@ static int read_device_message(int fd, uint8_t type, char **text,
     return 0;
 }
 
-/* Latin-1 rendering of UTF-8 text for clients without the extended
- * clipboard: code points above U+00FF and malformed bytes become '?'. */
 static size_t utf8_to_latin1(const uint8_t *in, size_t length, char *out) {
     size_t n = 0;
     size_t i = 0;
@@ -1170,10 +1170,6 @@ static uint32_t android_meta_state(uint32_t held) {
     return meta;
 }
 
-/* A shortcut key pressed and released at once: the X11 clipboard chords
- * Shift+Insert, Control+Insert and Shift+Delete become Control+V, C and X,
- * and a letter or digit with Control or Meta becomes its keycode. Returns
- * -1 for any other key. */
 static int shortcut_keycode(rfbKeySym key, uint32_t meta,
                             uint32_t *shortcut_meta) {
     *shortcut_meta = ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON;
@@ -1888,7 +1884,6 @@ done:
     return 0;
 }
 
-/* Reads the next control message, of size bytes, the test expects. */
 static int expect_control(int fd, const uint8_t *expected, size_t size) {
     uint8_t message[64];
     return size <= sizeof(message)
