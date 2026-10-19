@@ -2136,7 +2136,6 @@ static int clipboard_self_test(void) {
         goto done;
     }
 
-
     char latin1[] = "caf\xe9";
     set_clipboard_latin1(latin1, 4, &client);
     const uint8_t set_latin1[] = {
