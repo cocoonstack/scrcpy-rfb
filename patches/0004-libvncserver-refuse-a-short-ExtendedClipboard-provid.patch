@@ -1,0 +1,79 @@
+From 5169d5d828bb9c17d3fffc1a415cd268b75dbe8a Mon Sep 17 00:00:00 2001
+From: CMGS <ilskdw@gmail.com>
+Date: Mon, 19 Oct 2026 10:49:44 +0800
+Subject: [PATCH] libvncserver: refuse a short ExtendedClipboard provide, read
+ the clipboard under the send mutex
+
+A provide whose zlib data ended before the size it declared reached the
+text hook with the unfilled rest of its buffer. Refuse it, as a provide
+whose size field itself is short.
+
+A request or peek read extClipboardData without the client's send mutex,
+which rfbSendServerCutTextUTF8 holds while it frees and replaces that
+buffer. Take the mutex around the check and the send.
+---
+ src/libvncserver/rfbserver.c | 28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/src/libvncserver/rfbserver.c b/src/libvncserver/rfbserver.c
+index 88ac1a0..1b3d4e3 100644
+--- a/src/libvncserver/rfbserver.c
++++ b/src/libvncserver/rfbserver.c
+@@ -2248,7 +2248,7 @@ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char
+         stream.avail_out = 4;
+         stream.next_out = (unsigned char *)&size;
+         int err = inflate(&stream, Z_NO_FLUSH);
+-        if (err != Z_OK) {
++        if (err != Z_OK || stream.avail_out != 0) {
+             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
+             if (buf != NULL) {
+                 free(buf);
+@@ -2278,7 +2278,7 @@ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char
+         stream.avail_out = size;
+         stream.next_out = (unsigned char *)buf;
+         err = inflate(&stream, Z_NO_FLUSH);
+-        if (err != Z_OK && err != Z_STREAM_END) {
++        if ((err != Z_OK && err != Z_STREAM_END) || stream.avail_out != 0) {
+             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
+             free(buf);
+             inflateEnd(&stream);
+@@ -3000,20 +3000,28 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
+             free(str);
+             return;
+         } else if (extClipboardFlags & rfbExtendedClipboard_Request) {
++            rfbBool sent = TRUE;
++            LOCK(cl->sendMutex);
+             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Provide) &&
+                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
+-                if (!rfbSendExtendedServerCutTextData(cl, cl->extClipboardData, cl->extClipboardDataSize)) {
+-                    free(str);
+-                    return;
+-                }
++                sent = rfbSendExtendedServerCutTextData(cl, cl->extClipboardData, cl->extClipboardDataSize);
++            }
++            UNLOCK(cl->sendMutex);
++            if (!sent) {
++                free(str);
++                return;
+             }
+         } else if (extClipboardFlags & rfbExtendedClipboard_Peek) {
++            rfbBool sent = TRUE;
++            LOCK(cl->sendMutex);
+             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Notify) &&
+                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
+-                if (!rfbSendExtendedClipboardNotify(cl)) {
+-                    free(str);
+-                    return;
+-                }
++                sent = rfbSendExtendedClipboardNotify(cl);
++            }
++            UNLOCK(cl->sendMutex);
++            if (!sent) {
++                free(str);
++                return;
+             }
+         } else if (extClipboardFlags & rfbExtendedClipboard_Notify) {
+             cl->extClipboardRequested = FALSE;
+-- 
+2.54.0
+

@@ -1,0 +1,92 @@
+From ac18f357ee9c2cf052f9ed11c63a441cac028c83 Mon Sep 17 00:00:00 2001
+From: CMGS <ilskdw@gmail.com>
+Date: Mon, 19 Oct 2026 03:25:51 +0800
+Subject: [PATCH] libvncserver: accept an ExtendedClipboard notify from the
+ client
+
+The server's caps named request, peek and provide but not notify, and a
+notify from the client was ignored. A client that announces its clipboard
+with notify and sends the text only on request therefore never reached the
+server with UTF-8 text and fell back to Latin-1 cut text.
+
+Advertise notify, answer a text notify with a request, and keep
+extClipboardRequested set from that request until the provide arrives, so
+an application can hold a paste that the client sent ahead of its text.
+---
+ include/rfb/rfb.h            |  2 ++
+ src/libvncserver/rfbserver.c | 31 ++++++++++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/include/rfb/rfb.h b/include/rfb/rfb.h
+index e225c034..2d7af39c 100644
+--- a/include/rfb/rfb.h
++++ b/include/rfb/rfb.h
+@@ -723,6 +723,8 @@ typedef struct _rfbClientRec {
+     uint32_t extClipboardMaxUnsolicitedSize;
+     char *extClipboardData;
+     int extClipboardDataSize;
++    /** TRUE from a request for the text the client announced until its provide arrives */
++    rfbBool extClipboardRequested;
+ 
+ #ifdef LIBVNCSERVER_HAVE_LIBJPEG
+     /* Tight encoding internal variables, stored per-client for thread safety */
+diff --git a/src/libvncserver/rfbserver.c b/src/libvncserver/rfbserver.c
+index 5cb42654..88ac1a04 100644
+--- a/src/libvncserver/rfbserver.c
++++ b/src/libvncserver/rfbserver.c
+@@ -2124,7 +2124,7 @@ rfbSendExtendedClipboardCapability(rfbClientPtr cl) {
+     char buf[16] = {
+         0x03, 0x00, 0x00, 0x00,
+         0xFF, 0xFF, 0xFF, 0xF8, /* -8 */
+-        0x17, 0x00, 0x00, 0x01, /* text, request, peek, provide */
++        0x1F, 0x00, 0x00, 0x01, /* text, request, peek, notify, provide */
+         0x00, 0x10, 0x00, 0x00, /* max size is 1MiB */
+     };
+     if (rfbWriteExact(cl, buf, sizeof(buf)) < 0) {
+@@ -2152,6 +2152,25 @@ rfbSendExtendedClipboardNotify(rfbClientPtr cl) {
+     return TRUE;
+ }
+ 
++static rfbBool
++rfbSendExtendedClipboardRequest(rfbClientPtr cl) {
++    char buf[12] = {
++        0x03, 0x00, 0x00, 0x00,
++        0xFF, 0xFF, 0xFF, 0xFC, /* -4 */
++        0x02, 0x00, 0x00, 0x01, /* request text */
++    };
++    LOCK(cl->sendMutex);
++    if (rfbWriteExact(cl, buf, sizeof(buf)) < 0) {
++        rfbLogPerror("rfbSendExtendedClipboardRequest: write");
++        rfbCloseClient(cl);
++        UNLOCK(cl->sendMutex);
++        return FALSE;
++    }
++    UNLOCK(cl->sendMutex);
++    rfbStatRecordMessageSent(cl, rfbServerCutText, sizeof(buf), sizeof(buf));
++    return TRUE;
++}
++
+ static rfbBool
+ rfbSendExtendedServerCutTextData(rfbClientPtr cl, const char *data, int len) {
+     int i;
+@@ -2996,7 +3015,17 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
+                     return;
+                 }
+             }
++        } else if (extClipboardFlags & rfbExtendedClipboard_Notify) {
++            cl->extClipboardRequested = FALSE;
++            if (extClipboardFlags & rfbExtendedClipboard_Text) {
++                if (!rfbSendExtendedClipboardRequest(cl)) {
++                    free(str);
++                    return;
++                }
++                cl->extClipboardRequested = TRUE;
++            }
+         } else if (extClipboardFlags & rfbExtendedClipboard_Provide) {
++            cl->extClipboardRequested = FALSE;
+             if (!rfbProcessExtendedServerCutTextData(cl, extClipboardFlags, str + 4, msg.cct.length - 4)) {
+                 free(str);
+                 return;
+-- 
+2.54.0
+

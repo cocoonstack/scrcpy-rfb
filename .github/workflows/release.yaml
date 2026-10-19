@@ -113,8 +113,10 @@ jobs:
           curl -fsSL https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1 \
             -o dist/scrcpy-server-secure.jar
           echo "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae  dist/scrcpy-server-secure.jar" | sha256sum -c -
+          cp dist/scrcpy-server-secure.jar dist/scrcpy-server.jar
           bash server/patch-scrcpy-secure.sh dist/scrcpy-server-secure.jar
-          ( cd dist && sha256sum scrcpy-server-secure.jar > scrcpy-server-secure.jar.sha256 )
+          ( cd dist && sha256sum scrcpy-server-secure.jar > scrcpy-server-secure.jar.sha256 \
+            && sha256sum scrcpy-server.jar > scrcpy-server.jar.sha256 )
 
       - name: Create master release
         uses: softprops/action-gh-release@v3
@@ -137,6 +139,8 @@ jobs:
             dist/su1000-linux-arm64.sha256
             dist/scrcpy-server-secure.jar
             dist/scrcpy-server-secure.jar.sha256
+            dist/scrcpy-server.jar
+            dist/scrcpy-server.jar.sha256
             dist/build-info.json
           prerelease: true
           make_latest: false
