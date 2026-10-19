@@ -1,186 +1,74 @@
-name: Build and Release Master
+name: Release
 
 on:
   push:
-    branches: [master]
-  workflow_dispatch:
+    tags: ['dev-*']
 
 permissions:
   contents: write
   packages: write
 
 concurrency:
-  group: scrcpy-rfb-master-release
-  cancel-in-progress: true
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build builder image (cached FFmpeg layer)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.builder
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: scrcpy-rfb-builder:${{ matrix.arch }}
-          build-args: |
-            UBUNTU_PORTS_MIRROR=http://mirror.us.leaseweb.net/ubuntu-ports
-          cache-from: type=gha,scope=builder-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=builder-${{ matrix.arch }}
-
-      - name: Build Ubuntu 22.04 binary
-        run: |
-          docker run --rm \
-            --platform "${{ matrix.platform }}" \
-            -v "$PWD:/src" \
-            "scrcpy-rfb-builder:${{ matrix.arch }}"
-
-      - name: Verify artifact architecture and dependencies
-        run: |
-          artifact="dist/scrcpy-rfb-linux-${{ matrix.arch }}"
-          file "$artifact"
-          test -x "$artifact"
-          grep -F "scrcpy-rfb-linux-${{ matrix.arch }}" "$artifact.sha256"
-
-      - name: Build su1000 helper (runs the scrcpy server as the system uid)
-        run: |
-          # The builder container writes dist/ as root; take it back so gcc (runner user) can write.
-          sudo chown -R "$(id -u):$(id -g)" dist
-          su1000="dist/su1000-linux-${{ matrix.arch }}"
-          gcc -static -O2 -s -o "$su1000" server/su1000.c
-          file "$su1000"
-          ( cd dist && sha256sum "su1000-linux-${{ matrix.arch }}" > "su1000-linux-${{ matrix.arch }}.sha256" )
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: scrcpy-rfb-linux-${{ matrix.arch }}
-          path: |
-            dist/scrcpy-rfb-linux-${{ matrix.arch }}
-            dist/scrcpy-rfb-linux-${{ matrix.arch }}.sha256
-            dist/su1000-linux-${{ matrix.arch }}
-            dist/su1000-linux-${{ matrix.arch }}.sha256
+    uses: ./.github/workflows/build.yaml
 
   release:
-    name: Update master prerelease
+    name: Publish ${{ github.ref_name }}
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8.0.2
         with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: scrcpy-rfb-linux-*
+          name: dist
           path: dist
-          merge-multiple: true
 
-      - name: Generate build metadata
-        run: |
-          ffmpeg_commit=$(sed -n 's/^ARG FFMPEG_COMMIT=//p' docker/Dockerfile.builder)
-          cat > dist/build-info.json <<EOF
-          {
-            "ref": "${GITHUB_REF_NAME}",
-            "commit": "${GITHUB_SHA}",
-            "run_id": "${GITHUB_RUN_ID}",
-            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
-            "workflow": "${GITHUB_WORKFLOW}",
-            "ffmpeg_commit": "${ffmpeg_commit}"
-          }
-          EOF
-
-      - name: Build patched scrcpy-server (secure FLAG_SECURE mirror)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends smali default-jre-headless python3 unzip zip
-          curl -fsSL https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1 \
-            -o dist/scrcpy-server-secure.jar
-          echo "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae  dist/scrcpy-server-secure.jar" | sha256sum -c -
-          cp dist/scrcpy-server-secure.jar dist/scrcpy-server.jar
-          bash server/patch-scrcpy-secure.sh dist/scrcpy-server-secure.jar
-          ( cd dist && sha256sum scrcpy-server-secure.jar > scrcpy-server-secure.jar.sha256 \
-            && sha256sum scrcpy-server.jar > scrcpy-server.jar.sha256 )
-
-      - name: Create master release
-        uses: softprops/action-gh-release@v3
+      - name: Create release
+        uses: softprops/action-gh-release@v3.0.3
         with:
-          tag_name: master
-          target_commitish: ${{ github.sha }}
-          name: Master Build
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           body: |
-            Branch: `${{ github.ref_name }}`
+            Tag: `${{ github.ref_name }}`
             Commit: `${{ github.sha }}`
             Workflow Run: `${{ github.run_id }}`
-          files: |
-            dist/scrcpy-rfb-linux-amd64
-            dist/scrcpy-rfb-linux-amd64.sha256
-            dist/scrcpy-rfb-linux-arm64
-            dist/scrcpy-rfb-linux-arm64.sha256
-            dist/su1000-linux-amd64
-            dist/su1000-linux-amd64.sha256
-            dist/su1000-linux-arm64
-            dist/su1000-linux-arm64.sha256
-            dist/scrcpy-server-secure.jar
-            dist/scrcpy-server-secure.jar.sha256
-            dist/scrcpy-server.jar
-            dist/scrcpy-server.jar.sha256
-            dist/build-info.json
-          prerelease: true
+          files: dist/*
+          prerelease: false
           make_latest: false
-          overwrite_files: true
+          overwrite_files: false
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Move master tag to current commit
-        run: |
-          git tag -f master "${GITHUB_SHA}"
-          git push origin refs/tags/master --force
 
   docker:
     name: Push container image
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.2
         with:
-          pattern: scrcpy-rfb-linux-*
+          name: dist
           path: dist
-          merge-multiple: true
 
       - name: Make binaries executable
         run: chmod +x dist/scrcpy-rfb-linux-*
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4.4.1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: docker/Dockerfile.runtime
@@ -189,5 +77,4 @@ jobs:
           build-args: |
             UBUNTU_PORTS_MIRROR=http://mirror.us.leaseweb.net/ubuntu-ports
           tags: |
-            ghcr.io/${{ github.repository }}:master
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}

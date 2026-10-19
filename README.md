@@ -36,16 +36,22 @@ make        # cmake configure + build into build/
 make test   # build + run the self tests
 ```
 
-Pushes to `master` publish, via GitHub Actions:
+Every pull request builds both architectures and runs the self tests. Pushes
+to `dev` publish, via GitHub Actions:
 
 - `scrcpy-rfb-linux-amd64` / `-arm64` binaries, `su1000`, the patched
-  `scrcpy-server-secure.jar` and the unpatched `scrcpy-server.jar`, checksums
-  and `build-info.json` to the moving `master` prerelease;
-- a multi-arch container image at `ghcr.io/cocoonstack/scrcpy-rfb:master`
-  (also tagged with the commit SHA):
+  `scrcpy-server-secure.jar` and the unpatched `scrcpy-server.jar`, plus
+  `SHA256SUMS` and `build-info.json`, to the moving `dev` prerelease;
+- a multi-arch container image at `ghcr.io/cocoonstack/scrcpy-rfb:dev`
+  (also tagged with the commit SHA).
+
+Pushing a tag `dev-<9-char sha>` publishes the same assets once to a release of
+that name and never replaces them; pin that tag, never the moving `dev`
+release, and verify the files against its `SHA256SUMS`. The container image is
+tagged with the release tag.
 
 ```sh
-docker run --rm --network host ghcr.io/cocoonstack/scrcpy-rfb:master \
+docker run --rm --network host ghcr.io/cocoonstack/scrcpy-rfb:dev \
   --scrcpy-host 127.0.0.1 -rfbport 5900
 ```
 
