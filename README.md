@@ -12,9 +12,11 @@ scrcpy 4.x server to one RFB/VNC port.
 ## Building
 
 The project depends on upstream [LibVNC/libvncserver](https://github.com/LibVNC/libvncserver)
-at a pinned commit, fetched at configure time, plus the three patches in
+at a pinned commit, fetched at configure time, plus the four patches in
 `patches/` (the Open H.264 server-side encoding, a `deferUpdateTime=0`
-busy-loop fix, and ExtendedClipboard notify from the client). The first two
+busy-loop fix, ExtendedClipboard notify from the client, and a short provide
+refused with the clipboard read under the send mutex; the last two are the
+cocoonstack/libvncserver branch `ext-clipboard-notify`). The first two
 have been submitted upstream; once merged, the
 directory empties and the pin moves to a release tag.
 

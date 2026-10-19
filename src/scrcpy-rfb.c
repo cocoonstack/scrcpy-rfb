@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include <libswscale/swscale.h>
 #include <rfb/keysym.h>
 #include <rfb/rfb.h>
+#include <zlib.h>
 
 #define SCRCPY_DEFAULT_HOST "127.0.0.1"
 #define SCRCPY_DEFAULT_PORT 27183
@@ -73,6 +75,9 @@
 #define ANDROID_META_META_LEFT_ON 0x20000U
 #define ANDROID_META_META_RIGHT_ON 0x40000U
 #define PASTE_DEFER_NS UINT64_C(2000000000)
+#define CLIPBOARD_RETRY_MIN_MS 250U
+#define CLIPBOARD_RETRY_MAX_MS 8000U
+#define CLIPBOARD_SESSION_STEADY_NS UINT64_C(10000000000)
 #define CLIPBOARD_ECHO_NS UINT64_C(1000000000)
 
 #define FRAME_QUEUE_CAPACITY 90
@@ -113,6 +118,7 @@ struct client_state {
     int previous_wheel_buttons;
     uint32_t held_modifiers;
     uint64_t paste_deferred_ns;
+    int pastes_deferred;
     int last_pointer_x;
     int last_pointer_y;
 };
@@ -198,6 +204,11 @@ static pthread_mutex_t clipboard_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int video_fd = -1;
 static int control_fd = -1;
 static int clipboard_fd = -1;
+static pthread_mutex_t clipboard_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const char *clipboard_host;
+static uint16_t clipboard_port;
+static pthread_mutex_t paste_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int pastes_pending;
 static int video_width;
 static int video_height;
 static volatile sig_atomic_t running = 1;
@@ -902,33 +913,84 @@ static void send_server_clipboard(char *text, uint32_t length) {
     free(latin1);
 }
 
-/* A control socket carries device messages back: a new Android clipboard
- * goes to every client as ServerCutText; once the stream is unreadable the
- * rest is drained so the server never blocks on a full socket. */
-static void *control_reader_main(void *arg) {
-    int fd = (int) (intptr_t) arg;
-    uint8_t buffer[4096];
+/* Sends each new Android clipboard on fd to every client as ServerCutText
+ * until the stream ends (0) or turns unreadable (-1). */
+static int read_device_messages(int fd) {
     while (running) {
+        uint8_t type;
         char *text = NULL;
         uint32_t length = 0;
-        if (recv_all(fd, buffer, 1) <= 0) {
-            return NULL;
+        if (recv_all(fd, &type, 1) <= 0) {
+            return 0;
         }
-        if (read_device_message(fd, buffer[0], &text, &length) < 0) {
-            fprintf(stderr, "unreadable scrcpy device message type %u\n",
-                    buffer[0]);
-            break;
+        if (read_device_message(fd, type, &text, &length) < 0) {
+            fprintf(stderr, "unreadable scrcpy device message type %u\n", type);
+            return -1;
         }
         if (rfb_ready && !clipboard_echo(text, length)) {
             send_server_clipboard(text, length);
         }
         free(text);
     }
+    return 0;
+}
+
+/* Once the control stream is unreadable, the rest is drained so the server
+ * never blocks on a full socket. */
+static void *control_reader_main(void *arg) {
+    int fd = (int) (intptr_t) arg;
+    uint8_t buffer[4096];
+    if (read_device_messages(fd) == 0) {
+        return NULL;
+    }
     while (running) {
         ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             break;
         }
+    }
+    return NULL;
+}
+
+static void pause_while_running(unsigned ms) {
+    for (unsigned waited = 0; running && waited < ms; waited += 50) {
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+        nanosleep(&delay, NULL);
+    }
+}
+
+/* The shell session carries Android's clipboard; when it ends it is
+ * reconnected with backoff, so later copies still reach the clients. */
+static void *clipboard_reader_main(void *arg) {
+    (void) arg;
+    unsigned retry_ms = CLIPBOARD_RETRY_MIN_MS;
+    while (running) {
+        pthread_mutex_lock(&clipboard_fd_mutex);
+        int fd = clipboard_fd;
+        pthread_mutex_unlock(&clipboard_fd_mutex);
+        uint64_t started_ns = monotonic_ns();
+        int status = fd >= 0 ? read_device_messages(fd) : 0;
+        if (!running) {
+            break;
+        }
+        if (monotonic_ns() - started_ns >= CLIPBOARD_SESSION_STEADY_NS) {
+            retry_ms = CLIPBOARD_RETRY_MIN_MS;
+        }
+        fprintf(stderr, "scrcpy clipboard session %s; reconnecting in %u ms\n",
+                status < 0 ? "is unreadable" : "ended", retry_ms);
+        pause_while_running(retry_ms);
+        retry_ms = retry_ms * 2 < CLIPBOARD_RETRY_MAX_MS
+                 ? retry_ms * 2 : CLIPBOARD_RETRY_MAX_MS;
+        int next = running ? connect_tcp(clipboard_host, clipboard_port) : -1;
+        pthread_mutex_lock(&clipboard_fd_mutex);
+        if (clipboard_fd >= 0) {
+            close(clipboard_fd);
+        }
+        clipboard_fd = next;
+        if (!running && clipboard_fd >= 0) {
+            shutdown(clipboard_fd, SHUT_RDWR);
+        }
+        pthread_mutex_unlock(&clipboard_fd_mutex);
     }
     return NULL;
 }
@@ -1014,6 +1076,11 @@ static void client_gone(rfbClientPtr client) {
     pthread_mutex_unlock(&pointer_mutex);
     if (state && state->previous_right_button) {
         send_keycode(1, ANDROID_KEYCODE_BACK, 0);
+    }
+    if (state) {
+        pthread_mutex_lock(&paste_mutex);
+        pastes_pending -= state->pastes_deferred;
+        pthread_mutex_unlock(&paste_mutex);
     }
     free(client->clientData);
     client->clientData = NULL;
@@ -1253,22 +1320,59 @@ static size_t utf8_encode(uint32_t code_point, uint8_t *out) {
 }
 
 /* A paste sent while the client's announced text is still being requested
- * waits for that text and runs when it arrives, within PASTE_DEFER_NS. */
+ * waits for that text; each press counts. */
 static int defer_paste(rfbClientPtr client, struct client_state *state) {
     if (!client->extClipboardRequested) {
         return 0;
     }
-    uint64_t now = monotonic_ns();
-    if (!state->paste_deferred_ns) {
-        state->paste_deferred_ns = now;
-        return 1;
+    pthread_mutex_lock(&paste_mutex);
+    if (!state->pastes_deferred) {
+        state->paste_deferred_ns = monotonic_ns();
     }
-    if (now - state->paste_deferred_ns < PASTE_DEFER_NS) {
-        return 1;
+    ++state->pastes_deferred;
+    ++pastes_pending;
+    pthread_mutex_unlock(&paste_mutex);
+    return 1;
+}
+
+/* Runs a client's deferred pastes: when its text arrives, or, with expired,
+ * once PASTE_DEFER_NS passed without it, on the clipboard Android has. */
+static void run_deferred_pastes(rfbClientPtr client, int expired) {
+    struct client_state *state = client->clientData;
+    pthread_mutex_lock(&paste_mutex);
+    int pastes = state->pastes_deferred;
+    if (expired && monotonic_ns() - state->paste_deferred_ns < PASTE_DEFER_NS) {
+        pastes = 0;
     }
-    client->extClipboardRequested = FALSE;
-    state->paste_deferred_ns = 0;
-    return 0;
+    if (pastes) {
+        state->pastes_deferred = 0;
+        pastes_pending -= pastes;
+        if (expired) {
+            client->extClipboardRequested = FALSE;
+        }
+    }
+    pthread_mutex_unlock(&paste_mutex);
+    for (int i = 0; i < pastes; ++i) {
+        send_key_press(ANDROID_KEYCODE_V,
+                       ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON);
+    }
+}
+
+static void expire_deferred_pastes(void) {
+    pthread_mutex_lock(&paste_mutex);
+    int pending = pastes_pending;
+    pthread_mutex_unlock(&paste_mutex);
+    if (!pending) {
+        return;
+    }
+    rfbClientIteratorPtr iterator = rfbGetClientIterator(rfb_screen);
+    rfbClientPtr client;
+    while ((client = rfbClientIteratorNext(iterator)) != NULL) {
+        if (client->clientData) {
+            run_deferred_pastes(client, 1);
+        }
+    }
+    rfbReleaseClientIterator(iterator);
 }
 
 /* Copies text into a SET_CLIPBOARD message without its trailing NULs and
@@ -1305,7 +1409,6 @@ static size_t encode_set_clipboard(const char *text, size_t length,
  * client's paste key does that, or the paste deferred for this text. */
 static void forward_clipboard(const char *text, size_t length,
                               rfbClientPtr client) {
-    struct client_state *state = client->clientData;
     size_t capacity = SCRCPY_SET_CLIPBOARD_HEADER
                     + (length < SCRCPY_CLIPBOARD_TEXT_MAX
                            ? length : SCRCPY_CLIPBOARD_TEXT_MAX);
@@ -1319,13 +1422,7 @@ static void forward_clipboard(const char *text, size_t length,
             size - SCRCPY_SET_CLIPBOARD_HEADER);
     send_control(message, size);
     free(message);
-    if (state->paste_deferred_ns) {
-        if (monotonic_ns() - state->paste_deferred_ns < PASTE_DEFER_NS) {
-            send_key_press(ANDROID_KEYCODE_V,
-                           ANDROID_META_CTRL_ON | ANDROID_META_CTRL_LEFT_ON);
-        }
-        state->paste_deferred_ns = 0;
-    }
+    run_deferred_pastes(client, 0);
 }
 
 static void set_clipboard_utf8(char *text, int length, rfbClientPtr client) {
@@ -2057,6 +2154,41 @@ static int clipboard_self_test(void) {
         goto done;
     }
 
+    client.extClipboardRequested = TRUE;
+    for (int press = 0; press < 2; ++press) {
+        keyboard_event(TRUE, XK_Control_L, &client);
+        keyboard_event(TRUE, XK_v, &client);
+        keyboard_event(FALSE, XK_v, &client);
+        keyboard_event(FALSE, XK_Control_L, &client);
+    }
+    client.extClipboardRequested = FALSE;
+    set_clipboard_utf8(utf8, sizeof(utf8), &client);
+    if (!expect_control(fd, set_utf8, sizeof(set_utf8))
+            || !expect_key_press(fd, ANDROID_KEYCODE_V, ctrl)
+            || !expect_key_press(fd, ANDROID_KEYCODE_V, ctrl)
+            || !control_idle(fd)) {
+        failure = "two pastes deferred for one text did not both run";
+        goto done;
+    }
+
+    client.extClipboardRequested = TRUE;
+    keyboard_event(TRUE, XK_Shift_L, &client);
+    keyboard_event(TRUE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Insert, &client);
+    keyboard_event(FALSE, XK_Shift_L, &client);
+    run_deferred_pastes(&client, 1);
+    if (!control_idle(fd)) {
+        failure = "a deferred paste ran before its timeout";
+        goto done;
+    }
+    state.paste_deferred_ns -= PASTE_DEFER_NS;
+    run_deferred_pastes(&client, 1);
+    if (!expect_key_press(fd, ANDROID_KEYCODE_V, ctrl) || !control_idle(fd)
+            || client.extClipboardRequested || pastes_pending) {
+        failure = "a deferred paste whose text never came did not run at its timeout";
+        goto done;
+    }
+
     char latin1[] = "caf\xe9";
     set_clipboard_latin1(latin1, 4, &client);
     const uint8_t set_latin1[] = {
@@ -2153,6 +2285,182 @@ done:
     return 0;
 }
 
+static int listen_loopback(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {0};
+    socklen_t length = sizeof(addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0
+            || listen(fd, 4) < 0
+            || getsockname(fd, (struct sockaddr *) &addr, &length) < 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static int accept_within(int listener, int ms) {
+    struct timeval timeout = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
+    fd_set ready;
+    FD_ZERO(&ready);
+    FD_SET(listener, &ready);
+    if (select(listener + 1, &ready, NULL, NULL, &timeout) <= 0) {
+        return -1;
+    }
+    return accept(listener, NULL, NULL);
+}
+
+/* An ended clipboard session is logged and reconnected. */
+static int clipboard_session_self_test(void) {
+    const char *failure = NULL;
+    uint16_t port;
+    int listener = listen_loopback(&port);
+    int first = -1;
+    int second = -1;
+    pthread_t reader;
+    int started = 0;
+    if (listener < 0) {
+        fprintf(stderr, "clipboard session self-test: no listener\n");
+        return 1;
+    }
+    clipboard_host = "127.0.0.1";
+    clipboard_port = port;
+    clipboard_fd = connect_tcp(clipboard_host, clipboard_port);
+    first = accept_within(listener, 1000);
+    if (clipboard_fd < 0 || first < 0) {
+        failure = "the first session did not connect";
+        goto done;
+    }
+    started = !pthread_create(&reader, NULL, clipboard_reader_main, NULL);
+    close(first);
+    second = accept_within(listener, 3000);
+    if (second < 0) {
+        failure = "an ended session was not reconnected";
+        goto done;
+    }
+
+done:
+    running = 0;
+    pthread_mutex_lock(&clipboard_fd_mutex);
+    if (clipboard_fd >= 0) {
+        shutdown(clipboard_fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&clipboard_fd_mutex);
+    if (started) {
+        pthread_join(reader, NULL);
+    }
+    if (clipboard_fd >= 0) {
+        close(clipboard_fd);
+    }
+    clipboard_fd = -1;
+    clipboard_host = NULL;
+    clipboard_port = 0;
+    running = 1;
+    if (second >= 0) {
+        close(second);
+    }
+    close(listener);
+    if (failure) {
+        fprintf(stderr, "clipboard session self-test failed: %s\n", failure);
+        return 1;
+    }
+    return 0;
+}
+
+static char *provided_text;
+static int provided_length = -1;
+
+static void record_provided(char *text, int length, rfbClientPtr client) {
+    (void) client;
+    free(provided_text);
+    provided_text = malloc((size_t) length + 1);
+    if (provided_text) {
+        memcpy(provided_text, text, (size_t) length);
+        provided_text[length] = 0;
+    }
+    provided_length = length;
+}
+
+/* Sends one ExtendedClipboard provide of text whose zlib data declares
+ * declared bytes, and returns whether the server's text hook ran. */
+static int provide_reaches_hook(rfbScreenInfoPtr screen, const char *text,
+                                uint32_t declared) {
+    uint16_t port;
+    int listener = listen_loopback(&port);
+    int peer = listener >= 0 ? connect_tcp("127.0.0.1", port) : -1;
+    int server = peer >= 0 ? accept_within(listener, 1000) : -1;
+    int reached = -1;
+    if (server >= 0) {
+        rfbClientPtr cl = rfbNewClient(screen, server);
+        if (cl) {
+            cl->state = RFB_NORMAL;
+            cl->enableExtendedClipboard = TRUE;
+            uint8_t plain[64];
+            size_t length = strlen(text);
+            AV_WB32(plain, declared);
+            memcpy(plain + 4, text, length);
+            uint8_t packed[128];
+            uLongf packed_length = sizeof(packed);
+            if (compress(packed, &packed_length, plain, length + 4) == Z_OK) {
+                uint8_t message[8 + 4 + sizeof(packed)] = {rfbClientCutText};
+                AV_WB32(message + 4, (uint32_t) -(int32_t) (4 + packed_length));
+                AV_WB32(message + 8, rfbExtendedClipboard_Provide
+                                     | rfbExtendedClipboard_Text);
+                memcpy(message + 12, packed, packed_length);
+                provided_length = -1;
+                if (send_all(peer, message, 12 + packed_length) == 0) {
+                    rfbProcessClientMessage(cl);
+                    reached = provided_length >= 0;
+                }
+            }
+            rfbCloseClient(cl);
+            rfbClientConnectionGone(cl);
+        } else {
+            close(server);
+        }
+    }
+    if (peer >= 0) {
+        close(peer);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
+    return reached;
+}
+
+/* A provide whose zlib data ends before its declared size never reaches
+ * the text hook; a whole one does. */
+static int short_provide_self_test(void) {
+    int argc = 1;
+    char *argv[] = {"scrcpy-rfb-self-test", NULL};
+    rfbScreenInfoPtr screen = rfbGetScreen(&argc, argv, 16, 16, 8, 3, 4);
+    const char *failure = NULL;
+    if (!screen) {
+        fprintf(stderr, "short provide self-test: no screen\n");
+        return 1;
+    }
+    screen->setXCutTextUTF8 = record_provided;
+    if (provide_reaches_hook(screen, "abc", 64) != 0) {
+        failure = "a provide shorter than its declared size reached the hook";
+    } else if (provide_reaches_hook(screen, "abc", 3) != 1
+            || provided_length != 3 || !provided_text
+            || strcmp(provided_text, "abc")) {
+        failure = "a whole provide did not reach the hook with its text";
+    }
+    free(provided_text);
+    provided_text = NULL;
+    rfbScreenCleanup(screen);
+    if (failure) {
+        fprintf(stderr, "short provide self-test failed: %s\n", failure);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_self_test(void) {
     const int width = 320;
     const int height = 480;
@@ -2163,7 +2471,8 @@ static int run_self_test(void) {
     if (fallback_decode_resync_self_test()) {
         return 1;
     }
-    if (input_self_test() || clipboard_self_test()) {
+    if (input_self_test() || clipboard_self_test()
+            || clipboard_session_self_test() || short_provide_self_test()) {
         return 1;
     }
     size_t size = (size_t) width * (size_t) height * 4;
@@ -2642,6 +2951,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (options.clipboard_port) {
+        clipboard_host = options.scrcpy_host;
+        clipboard_port = options.clipboard_port;
         clipboard_fd = connect_tcp(options.scrcpy_host, options.clipboard_port);
         if (clipboard_fd < 0) {
             fprintf(stderr, "failed to connect scrcpy clipboard socket\n");
@@ -2679,9 +2990,9 @@ int main(int argc, char **argv) {
     pthread_create(&video_thread, NULL, video_reader_main, NULL);
     pthread_create(&control_thread, NULL, control_reader_main,
                    (void *) (intptr_t) control_fd);
-    if (clipboard_fd >= 0) {
-        pthread_create(&clipboard_thread, NULL, control_reader_main,
-                       (void *) (intptr_t) clipboard_fd);
+    int clipboard_session = clipboard_fd >= 0;
+    if (clipboard_session) {
+        pthread_create(&clipboard_thread, NULL, clipboard_reader_main, NULL);
     }
     pthread_create(&decoder_thread, NULL, decoder_main, NULL);
 
@@ -2749,6 +3060,7 @@ int main(int argc, char **argv) {
     unsigned copyrect_frames_since_log = 0;
     int last_copyrect_dy = 0;
     while (running && rfbIsActive(rfb_screen)) {
+        expire_deferred_pastes();
         int h264_clients;
         int standard_clients;
         int copyrect_clients;
@@ -2883,9 +3195,11 @@ int main(int argc, char **argv) {
     rfbShutdownServer(rfb_screen, TRUE);
     shutdown(video_fd, SHUT_RDWR);
     shutdown(control_fd, SHUT_RDWR);
+    pthread_mutex_lock(&clipboard_fd_mutex);
     if (clipboard_fd >= 0) {
         shutdown(clipboard_fd, SHUT_RDWR);
     }
+    pthread_mutex_unlock(&clipboard_fd_mutex);
     pthread_mutex_lock(&decode_mutex);
     pthread_cond_broadcast(&decode_cond);
     pthread_mutex_unlock(&decode_mutex);
@@ -2894,8 +3208,10 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&screen_ready_mutex);
     pthread_join(video_thread, NULL);
     pthread_join(control_thread, NULL);
-    if (clipboard_fd >= 0) {
+    if (clipboard_session) {
         pthread_join(clipboard_thread, NULL);
+    }
+    if (clipboard_fd >= 0) {
         close(clipboard_fd);
     }
     pthread_join(decoder_thread, NULL);
