@@ -70,7 +70,8 @@ clipboard from it. Android lets only a focused app, the IME or a holder of
 `READ_CLIPBOARD_IN_BACKGROUND` read the clipboard, so a server that runs as the
 system uid (the patched FLAG_SECURE server) cannot; the unpatched
 `scrcpy-server.jar` run as shell can. Without the option the main session reads
-it.
+it. When the session ends the bridge reconnects with backoff, 250 ms to 8 s; the
+box restarts the shell server.
 
 `--turn-screen-off` asks the scrcpy server to power off the physical display
 after the video, control, and RFB paths are ready. Mirroring continues through
@@ -152,9 +153,11 @@ disable-display-resize: true
   Shift+Insert, Control+Insert and Shift+Delete become Control+V, C and X.
 - Clipboard: a client's cut text (Latin-1, or UTF-8 over the ExtendedClipboard
   extension) becomes the Android clipboard without a paste of its own; the
-  client's paste key pastes it. A paste that arrives while the server is still
-  requesting text the client announced waits up to 2 s for that text. A new
+  client's paste key pastes it. Pastes pressed while the announced text is
+  still being requested run, one per press, when it arrives within 2 s. A new
   Android clipboard goes to every client as ServerCutText, UTF-8 where the
-  client has the extension and Latin-1 otherwise.
+  client has the extension and Latin-1 otherwise. When the `--clipboard-port`
+  session ends the bridge reconnects with backoff, 250 ms to 8 s; the box
+  restarts the shell server.
 - The scrcpy session size is fixed; device rotation or resolution change
   requires a restart.
